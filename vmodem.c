@@ -35,6 +35,10 @@
 
 VModemState  g_state;
 
+/* InDOS flag pointer — obtained via INT 21h AH=34h at startup.
+ * When *g_indos_ptr == 0, DOS is not in a system call and file I/O is safe. */
+unsigned char __far *g_indos_ptr = NULL;
+
 /* Debug: unhandled packet counter and first EtherType seen */
 static unsigned long  g_unhandled_count = 0;
 static unsigned short g_first_unhandled_et = 0;
@@ -98,6 +102,36 @@ static VModemState __far *check_installed(void)
     if (r.h.al != 0xFF)
         return NULL;
     return (VModemState __far *)MK_FP(sr.es, r.x.bx);
+}
+
+/* -----------------------------------------------------------------------
+ * Debug log helpers
+ * --------------------------------------------------------------------- */
+
+void dbg(const char *msg)
+{
+    while (*msg) {
+        g_state.dbglog[g_state.dbglog_head] = *msg;
+        g_state.dbglog_head = (g_state.dbglog_head + 1) % DBGLOG_SIZE;
+        if (g_state.dbglog_count < DBGLOG_SIZE)
+            g_state.dbglog_count++;
+        msg++;
+    }
+}
+
+static const char hex_chars[] = "0123456789ABCDEF";
+
+void dbg_hex(const char *prefix, unsigned char val)
+{
+    char buf[8];
+    int i = 0;
+    const char *p = prefix;
+    while (*p && i < 4) buf[i++] = *p++;
+    buf[i++] = hex_chars[(val >> 4) & 0x0F];
+    buf[i++] = hex_chars[val & 0x0F];
+    buf[i++] = ' ';
+    buf[i] = '\0';
+    dbg(buf);
 }
 
 /* -----------------------------------------------------------------------
@@ -687,7 +721,49 @@ int main(int argc, char *argv[])
     old_int28 = _dos_getvect(0x28);
     old_int2f = _dos_getvect(0x2F);
     _dos_setvect(0x1C, int1c_handler);
-    _dos_setvect(0x14, int14_handler);
+    /* Build the FOSSIL signature stub dynamically in g_state.fossil_stub[].
+     * This lives in DGROUP (DS-relative), so we know exactly where it is.
+     * The stub is a tiny trampoline:
+     *   +0: EB 07        jmp short +9  (skip signature)
+     *   +2: 90 90 90 90  nops (padding)
+     *   +6: 54 19        FOSSIL signature 1954h (little-endian)
+     *   +8: 1B           max function number
+     *   +9: EA xx xx yy yy  jmp far yy:xx (to int14_real_handler)
+     */
+    {
+        unsigned char *s = g_state.fossil_stub;
+        unsigned short real_off = FP_OFF(int14_real_handler);
+        unsigned short real_seg = FP_SEG(int14_real_handler);
+        unsigned short stub_off, stub_seg;
+
+        s[0] = 0xEB; s[1] = 0x07;              /* jmp short past_sig */
+        s[2] = 0x90; s[3] = 0x90;              /* nop; nop */
+        s[4] = 0x90; s[5] = 0x90;              /* nop; nop */
+        s[6] = 0x54; s[7] = 0x19;              /* dw 1954h */
+        s[8] = 0x1B;                            /* db 1Bh (max func) */
+        s[9] = 0xEA;                            /* jmp far imm */
+        s[10] = (unsigned char)(real_off & 0xFF);
+        s[11] = (unsigned char)(real_off >> 8);
+        s[12] = (unsigned char)(real_seg & 0xFF);
+        s[13] = (unsigned char)(real_seg >> 8);
+
+        /* The stub is in DS (DGROUP).  In small model the code segment
+         * (CS) is different from DS, but the CPU just needs seg:off to
+         * reach the bytes.  DS is a valid segment for execution. */
+        stub_seg = FP_SEG((void __far *)s);
+        stub_off = FP_OFF((void __far *)s);
+
+        printf("FOSSIL stub at %04X:%04X -> real handler %04X:%04X\n",
+               stub_seg, stub_off, real_seg, real_off);
+        printf("  Bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],
+               s[8],s[9],s[10],s[11],s[12],s[13]);
+
+        _disable();
+        *(unsigned short __far *)MK_FP(0x0000, 0x0050) = stub_off;
+        *(unsigned short __far *)MK_FP(0x0000, 0x0052) = stub_seg;
+        _enable();
+    }
     _dos_setvect(0x28, int28_handler);
     _dos_setvect(0x2F, int2f_handler);
 
@@ -725,6 +801,37 @@ int main(int argc, char *argv[])
         /* Leave CR=0x22 — do NOT restore a stale CR value that might
          * have a Remote DMA command in progress (e.g., CR=0x0A). */
     }
+
+    /* Get InDOS flag address — used by poll.c to check if DOS file I/O is safe */
+    {
+        union REGS r;
+        struct SREGS sr;
+        r.h.ah = 0x34;
+        int86x(0x21, &r, &r, &sr);
+        g_indos_ptr = (unsigned char __far *)MK_FP(sr.es, r.x.bx);
+    }
+
+    /* Open debug log file — the handle stays valid after TSR.
+     * poll.c flushes new debug content to this handle periodically. */
+    {
+        int fd = -1;
+        g_state.dbglog_fd = -1;
+        if (_dos_creat("VMODEM.LOG", 0, &fd) == 0) {
+            unsigned written = 0;
+            g_state.dbglog_fd = (short)fd;
+            /* Verify the handle works with a test write */
+            _dos_write(fd, "=== VMODEM debug log ===\r\n", 25, &written);
+            _dos_commit(fd);
+            printf("Debug log: VMODEM.LOG (fd=%d, wrote=%u)\n", fd, written);
+        }
+    }
+    /* Save our PSP segment — needed by poll.c to switch PSP for file I/O.
+     * File handles are per-PSP; after TSR, the active PSP belongs to
+     * whatever program is running. We must switch to our PSP before
+     * using our file handles. */
+    g_state.our_psp = _psp;
+
+    dbg("VMODEM loaded\n");
 
     /* Go TSR:
      * paras = paragraphs from PSP to end of full DGROUP (including near heap).

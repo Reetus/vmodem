@@ -28,9 +28,23 @@
 
 void telnet_send_raw(PortState *p, unsigned char *buf, int len)
 {
-    if (p->sock == NULL || !p->sock->isEstablished())
+    if (p->sock == NULL || p->sock->isClosed())
         return;
     p->sock->send(buf, (uint16_t)len);
+}
+
+/* -----------------------------------------------------------------------
+ * telnet_send_text — send a plain-text string directly to the TCP client.
+ * Used for status messages (ringing, connected, etc.) that the telnet
+ * user sees but the BBS never touches.
+ * --------------------------------------------------------------------- */
+
+void telnet_send_text(int port_idx, const char *msg)
+{
+    PortState *p = &g_state.ports[port_idx];
+    int len = 0;
+    while (msg[len]) len++;
+    telnet_send_raw(p, (unsigned char *)msg, len);
 }
 
 /* -----------------------------------------------------------------------
@@ -206,7 +220,7 @@ void telnet_send_byte(PortState *p, unsigned char b)
      */
     static unsigned char buf[2];
 
-    if (p->sock == NULL || !p->sock->isEstablished())
+    if (p->sock == NULL || p->sock->isClosed())
         return;
 
     if (b == 0xFF) {

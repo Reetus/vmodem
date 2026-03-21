@@ -48,10 +48,17 @@ static unsigned long bios_ticks(void)
 static void com_init(int port)
 {
     union REGS r;
-    r.h.ah = 0x00;
-    r.h.al = 0xE3;   /* 9600 baud, 8N1 — VMODEM ignores this */
+
+    /* FOSSIL init (AH=04h) — returns AX=1954h if FOSSIL present */
+    r.h.ah = 0x04;
     r.w.dx = (unsigned short)port;
+    r.w.bx = 0;  /* no ^C flag */
     int86(0x14, &r, &r);
+    if (r.w.ax == 0x1954)
+        printf("FOSSIL driver detected (rev %d, max func 0x%02X)\n",
+               r.h.bh, r.h.bl);
+    else
+        printf("Warning: No FOSSIL driver (AX=0x%04X)\n", r.w.ax);
 }
 
 /* Returns byte received, or -1 if no data (timeout bit set) */
@@ -149,6 +156,29 @@ static void cmd_status(void)
     int i;
 
     memset(&sb, 0, sizeof(sb));
+
+    /* FOSSIL signature check (same method BBS software uses) */
+    {
+        void (__interrupt __far *vec14)(void) = _dos_getvect(0x14);
+        unsigned char __far *bptr = (unsigned char __far *)vec14;
+        unsigned short sig = *(unsigned short __far *)(bptr + 6);
+
+        printf("FOSSIL check: INT 14h -> %04X:%04X\n",
+               FP_SEG(vec14), FP_OFF(vec14));
+        printf("  Bytes: %02X %02X %02X %02X %02X %02X [%02X %02X] %02X\n",
+               bptr[0], bptr[1], bptr[2], bptr[3], bptr[4], bptr[5],
+               bptr[6], bptr[7], bptr[8]);
+        printf("  Sig at +6: 0x%04X %s\n",
+               sig, (sig == 0x1954) ? "FOSSIL OK" : "NOT FOSSIL");
+
+        /* Try AH=04h init */
+        r.h.ah = 0x04;
+        r.w.dx = 0;
+        r.w.bx = 0;
+        int86(0x14, &r, &r);
+        printf("  Init: AX=0x%04X BH=%d BL=0x%02X\n",
+               r.w.ax, r.h.bh, r.h.bl);
+    }
 
     /* Call INT 2Fh MUX_INSTALL_CHK to detect VMODEM */
     r.h.ah = MUX_ID;
@@ -375,12 +405,324 @@ static void cmd_echo(void)
     }
 }
 
+/* Returns full FOSSIL status AX (AH=LSR, AL=MSR) */
+static unsigned short com_status(int port)
+{
+    union REGS r;
+    r.h.ah = 0x03;
+    r.w.dx = (unsigned short)port;
+    int86(0x14, &r, &r);
+    return r.w.ax;
+}
+
+static void com_dtr(int port, int raise)
+{
+    union REGS r;
+    r.h.ah = 0x06;
+    r.h.al = raise ? 0x01 : 0x00;
+    r.w.dx = (unsigned short)port;
+    int86(0x14, &r, &r);
+}
+
+static void poll_mtcp(void)
+{
+    union REGS r;
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_POLL;
+    int86(0x2F, &r, &r);
+}
+
+static void delay_ticks(unsigned long ticks)
+{
+    unsigned long start = bios_ticks();
+    while (bios_ticks() - start < ticks) {
+        poll_mtcp();
+    }
+}
+
+static void dump_debuglog(void)
+{
+    union REGS r;
+    struct SREGS sr;
+    char dbgbuf[2048];
+    unsigned short got, k;
+
+    segread(&sr);
+    sr.es = FP_SEG(dbgbuf);
+    r.h.ah = MUX_ID;
+    r.h.al = 0x06;  /* MUX_DEBUGLOG */
+    r.w.bx = FP_OFF(dbgbuf);
+    r.w.cx = sizeof(dbgbuf);
+    int86x(0x2F, &r, &r, &sr);
+    got = r.w.ax;
+
+    printf("  Debug log (%u bytes): [", got);
+    for (k = 0; k < got; k++) {
+        unsigned char c = (unsigned char)dbgbuf[k];
+        if (c >= 0x20 && c < 0x7F)
+            putchar(c);
+        else
+            printf("\\x%02X", c);
+    }
+    printf("]\n");
+}
+
+static void cmd_hangup(void)
+{
+    unsigned short st;
+    int pass;
+
+    printf("\n=== HANGUP TEST ===\n");
+    printf("Tests: FOSSIL init, wait for connect, +++, ATH, verify disconnect\n\n");
+
+    /* Step 1: FOSSIL init */
+    printf("[1] FOSSIL init (AH=04h)...\n");
+    com_init(COM1);
+
+    /* Step 2: Check initial status */
+    st = com_status(COM1);
+    printf("[2] Initial status: AH=0x%02X AL=0x%02X (DCD=%s)\n",
+           (st >> 8) & 0xFF, st & 0xFF,
+           (st & 0x80) ? "ON" : "off");
+
+    /* Step 3: Wait for connection (DCD high) */
+    printf("[3] Waiting for TCP connection (DCD)...\n");
+    fflush(stdout);
+    {
+        unsigned long start = bios_ticks();
+        unsigned long timeout = 18UL * 30;  /* 30 seconds */
+        while (!com_dcd(COM1)) {
+            poll_mtcp();
+            if (bios_ticks() - start > timeout) {
+                printf("    TIMEOUT - no connection after 30s\n");
+                dump_debuglog();
+                return;
+            }
+        }
+    }
+
+    st = com_status(COM1);
+    printf("    Connected! Status: AH=0x%02X AL=0x%02X\n",
+           (st >> 8) & 0xFF, st & 0xFF);
+
+    /* Drain any pending RX data (CONNECT response etc.) */
+    {
+        int b, count = 0;
+        while ((b = com_recv(COM1)) >= 0) count++;
+        printf("    Drained %d RX bytes\n", count);
+    }
+
+    /* Step 4: Send some data to establish last_tx_tick */
+    printf("[4] Sending test data 'HELLO'...\n");
+    com_send_str(COM1, "HELLO\r\n");
+    poll_mtcp();
+
+    /* Step 5: Guard time silence (~1 second) */
+    printf("[5] Guard time silence (1s)...\n");
+    fflush(stdout);
+    delay_ticks(20);  /* ~1.1 seconds */
+
+    /* Step 6: Send +++ escape sequence */
+    printf("[6] Sending +++ escape...\n");
+    com_send(COM1, '+');
+    com_send(COM1, '+');
+    com_send(COM1, '+');
+
+    /* Wait a moment for OK response */
+    delay_ticks(5);
+
+    /* Check if we got OK response */
+    {
+        char resp[32];
+        int rlen = 0, b;
+        while ((b = com_recv(COM1)) >= 0 && rlen < 30) {
+            resp[rlen++] = (char)b;
+        }
+        resp[rlen] = '\0';
+        printf("    Response (%d bytes): '", rlen);
+        {
+            int j;
+            for (j = 0; j < rlen; j++) {
+                if (resp[j] >= 0x20 && resp[j] < 0x7F)
+                    putchar(resp[j]);
+                else
+                    printf("\\x%02X", (unsigned char)resp[j]);
+            }
+        }
+        printf("'\n");
+
+        if (rlen == 0) {
+            printf("    WARNING: No response to +++ (not in command mode?)\n");
+        }
+    }
+
+    st = com_status(COM1);
+    printf("    Status after +++: AH=0x%02X AL=0x%02X (DCD=%s)\n",
+           (st >> 8) & 0xFF, st & 0xFF,
+           (st & 0x80) ? "ON" : "off");
+
+    /* Step 7: Send ATH to hangup */
+    printf("[7] Sending ATH0\\r...\n");
+    com_send_str(COM1, "ATH0\r");
+    delay_ticks(5);
+
+    /* Read response */
+    {
+        char resp[64];
+        int rlen = 0, b;
+        while ((b = com_recv(COM1)) >= 0 && rlen < 60) {
+            resp[rlen++] = (char)b;
+        }
+        resp[rlen] = '\0';
+        printf("    Response (%d bytes): '", rlen);
+        {
+            int j;
+            for (j = 0; j < rlen; j++) {
+                if (resp[j] >= 0x20 && resp[j] < 0x7F)
+                    putchar(resp[j]);
+                else
+                    printf("\\x%02X", (unsigned char)resp[j]);
+            }
+        }
+        printf("'\n");
+    }
+
+    /* Step 8: Verify DCD is now low */
+    poll_mtcp();
+    st = com_status(COM1);
+    pass = !(st & 0x80);
+    printf("[8] Final status: AH=0x%02X AL=0x%02X (DCD=%s)\n",
+           (st >> 8) & 0xFF, st & 0xFF,
+           (st & 0x80) ? "ON" : "off");
+    printf("    %s: DCD is %s after ATH\n",
+           pass ? "PASS" : "FAIL",
+           pass ? "LOW (disconnected)" : "still HIGH (connection NOT closed!)");
+
+    /* Step 9: Also test DTR drop disconnect */
+    if (pass) {
+        printf("\n[9] Skipping DTR test (already disconnected).\n");
+    } else {
+        printf("\n[9] ATH failed. Trying DTR drop (AH=06h AL=00h)...\n");
+        com_dtr(COM1, 0);  /* lower DTR */
+        delay_ticks(5);
+        poll_mtcp();
+
+        st = com_status(COM1);
+        pass = !(st & 0x80);
+        printf("    Status after DTR drop: AH=0x%02X AL=0x%02X (DCD=%s)\n",
+               (st >> 8) & 0xFF, st & 0xFF,
+               (st & 0x80) ? "ON" : "off");
+        printf("    %s: DTR drop %s\n",
+               pass ? "PASS" : "FAIL",
+               pass ? "disconnected" : "also FAILED");
+
+        /* Raise DTR again for clean state */
+        com_dtr(COM1, 1);
+    }
+
+    /* Dump debug log */
+    printf("\n[10] Debug log:\n");
+    dump_debuglog();
+}
+
+static void cmd_fosslog(void)
+{
+    union REGS r;
+    struct SREGS sr;
+    char dbgbuf[2048];
+    unsigned short got;
+    int found_f = 0;
+    unsigned short k;
+
+    /* Step 1: Drain the existing debug log */
+    segread(&sr);
+    sr.es = FP_SEG(dbgbuf);
+    r.h.ah = MUX_ID;
+    r.h.al = 0x06;  /* MUX_DEBUGLOG */
+    r.w.bx = FP_OFF(dbgbuf);
+    r.w.cx = sizeof(dbgbuf);
+    int86x(0x2F, &r, &r, &sr);
+    printf("Drained %u bytes from old log.\n", r.w.ax);
+
+    /* Step 2: Send FOSSIL AH=04h (init) on COM1 */
+    printf("Sending FOSSIL AH=04h init on COM1...\n");
+    r.h.ah = 0x04;
+    r.w.dx = 0;  /* COM1 */
+    r.w.bx = 0;
+    int86(0x14, &r, &r);
+    printf("  AH=04h returned AX=0x%04X (expect 0x1954)\n", r.w.ax);
+
+    /* Step 3: Send FOSSIL AH=03h (status) on COM1 */
+    printf("Sending FOSSIL AH=03h status on COM1...\n");
+    r.h.ah = 0x03;
+    r.w.dx = 0;
+    int86(0x14, &r, &r);
+    printf("  AH=03h returned AX=0x%04X (AH=LSR AL=MSR)\n", r.w.ax);
+
+    /* Step 4: Send FOSSIL AH=06h (DTR raise) on COM1 */
+    printf("Sending FOSSIL AH=06h DTR raise on COM1...\n");
+    r.h.ah = 0x06;
+    r.h.al = 0x01;  /* raise DTR */
+    r.w.dx = 0;
+    int86(0x14, &r, &r);
+
+    /* Step 5: Send a TX byte (AH=01h) - letter 'X' */
+    printf("Sending FOSSIL AH=01h TX 'X' on COM1...\n");
+    r.h.ah = 0x01;
+    r.h.al = 'X';
+    r.w.dx = 0;
+    int86(0x14, &r, &r);
+
+    /* Step 6: Read the debug log */
+    memset(dbgbuf, 0, sizeof(dbgbuf));
+    segread(&sr);
+    sr.es = FP_SEG(dbgbuf);
+    r.h.ah = MUX_ID;
+    r.h.al = 0x06;  /* MUX_DEBUGLOG */
+    r.w.bx = FP_OFF(dbgbuf);
+    r.w.cx = sizeof(dbgbuf);
+    int86x(0x2F, &r, &r, &sr);
+    got = r.w.ax;
+
+    printf("\nDebug log (%u bytes):\n", got);
+    if (got == 0) {
+        printf("  (EMPTY - no log data at all!)\n");
+        return;
+    }
+
+    /* Print the log, replacing non-printable chars */
+    printf("  [");
+    for (k = 0; k < got; k++) {
+        unsigned char c = (unsigned char)dbgbuf[k];
+        if (c >= 0x20 && c < 0x7F)
+            putchar(c);
+        else
+            printf("\\x%02X", c);
+    }
+    printf("]\n\n");
+
+    /* Check for F: entries */
+    for (k = 0; k + 1 < got; k++) {
+        if (dbgbuf[k] == 'F' && dbgbuf[k+1] == ':') {
+            found_f = 1;
+            break;
+        }
+    }
+
+    if (found_f)
+        printf("PASS: Found F: entries in debug log.\n");
+    else
+        printf("FAIL: No F: entries found! FOSSIL logging is broken.\n");
+}
+
 int main(int argc, char *argv[])
 {
     printf("VMODTEST - VMODEM COM port test utility\n");
 
+    /* FOSSIL detection disabled for now */
+
     if (argc < 2) {
-        printf("Usage: VMODTEST /ECHO | /STATUS\n");
+        printf("Usage: VMODTEST /ECHO | /STATUS | /FOSSLOG | /HANGUP\n");
         return 1;
     }
 
@@ -388,6 +730,10 @@ int main(int argc, char *argv[])
         cmd_echo();
     } else if (_fstricmp(argv[1], "/STATUS") == 0) {
         cmd_status();
+    } else if (_fstricmp(argv[1], "/FOSSLOG") == 0) {
+        cmd_fosslog();
+    } else if (_fstricmp(argv[1], "/HANGUP") == 0) {
+        cmd_hangup();
     } else {
         printf("Unknown option: %s\n", argv[1]);
         return 1;

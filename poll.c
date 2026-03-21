@@ -14,6 +14,7 @@
 #include <string.h>
 #include <dos.h>
 #include <i86.h>
+#include <conio.h>
 #include "vmodem.h"
 #include "packet.h"
 #include "tcp.h"
@@ -23,6 +24,13 @@
 #include "udp.h"
 #include "dns.h"
 #include "utils.h"
+
+/* From vmodem.c — InDOS flag pointer (NULL if not initialized) */
+extern unsigned char __far *g_indos_ptr;
+/* From int8.c — set to 1 during INT 28h context (DOS file I/O safe) */
+extern unsigned char g_dos_safe;
+/* From int14.c — set to 1 during INT 14h poll (software interrupt, DOS I/O safe) */
+extern unsigned char g_int14_safe;
 
 /* -----------------------------------------------------------------------
  * do_mtcp_poll
@@ -141,8 +149,19 @@ void do_mtcp_poll(void)
                 }
                 p->sock = ns;
                 p->mode = PORT_CONN;
+                p->conn_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                p->last_rx_tick = p->conn_tick;
                 ring_init(&p->rx);
                 telnet_on_connect(i);
+
+                /* Notify the telnet caller that we're ringing */
+                telnet_send_text(i, "\r\nRinging the host, please wait...\r\n");
+
+                /* Inject RING so BBS sees the incoming call.
+                 * CONNECT is NOT sent here — the BBS must answer
+                 * with ATA (or auto-answer via S0 register). */
+                at_send_ring(i);
+
                 if (p->listenSock == NULL) {
                     TcpSocket *ls = TcpSocketMgr::getSocket();
                     if (ls) {
@@ -164,10 +183,58 @@ void do_mtcp_poll(void)
                 break;
             }
 
+            /* Detect DTR drop via direct UART I/O (e.g. Telix writes to MCR).
+             * Read real UART MCR register (base+4) — if DTR (bit 0) is low
+             * and we didn't lower it via FOSSIL AH=06h, the app hung up. */
+            {
+                unsigned short uart_base =
+                    *(volatile unsigned short __far *)MK_FP(0x0040, i * 2);
+                if (uart_base != 0) {
+                    unsigned char mcr = inp(uart_base + 4);
+                    if (!(mcr & 0x01)) {
+                        /* DTR dropped via direct I/O — disconnect */
+                        dbg("[DTR-IO]");
+                        fossil_flush_tx(i);
+                        p->sock->close();
+                        TcpSocketMgr::freeSocket(p->sock);
+                        p->sock = NULL;
+                        ring_init(&p->rx);
+                        at_send_no_carrier(i);
+                        if (p->listenSock)
+                            p->mode = PORT_LISTEN;
+                        else
+                            p->mode = PORT_DISC;
+                        break;
+                    }
+                }
+            }
+
+            /* Flush any buffered TX data from the FOSSIL TX ring */
+            fossil_flush_tx(i);
+
+            /* Log socket state once after connection */
+            {
+                static unsigned char logged_state = 0;
+                if (!logged_state) {
+                    static const char shx[] = "0123456789ABCDEF";
+                    static char sb[8] = { 'S', 'S', ':', '0', ' ', '\0' };
+                    unsigned char st = p->sock->state;
+                    sb[3] = shx[st & 0x0F];
+                    dbg(sb);
+                    logged_state = 1;
+                }
+            }
+
             while (p->sock->recvDataWaiting()) {
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
+                    static unsigned char logged_rx = 0;
                     int j;
+                    p->last_rx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                    if (!logged_rx) {
+                        dbg("[RX-TCP]");
+                        logged_rx = 1;
+                    }
                     for (j = 0; j < n; j++) {
                         int b = telnet_filter(p, tmp[j]);
                         if (b >= 0)
@@ -178,15 +245,48 @@ void do_mtcp_poll(void)
                 }
             }
 
-            if (p->sock->isRemoteClosed() || p->sock->isClosed()) {
-                p->sock->close();
-                TcpSocketMgr::freeSocket(p->sock);
-                p->sock = NULL;
-                ring_init(&p->rx);
-                if (p->listenSock)
-                    p->mode = PORT_LISTEN;
-                else
-                    p->mode = PORT_DISC;
+            /* Log socket state changes for disconnect debugging */
+            {
+                static unsigned char last_state = 255;
+                unsigned char cur_state = p->sock->state;
+                if (cur_state != last_state) {
+                    static const char shx2[] = "0123456789ABCDEF";
+                    static char sb2[8] = { 'S', 'T', ':', '0', ' ', '\0' };
+                    sb2[3] = shx2[cur_state & 0x0F];
+                    dbg(sb2);
+                    last_state = cur_state;
+                }
+            }
+
+            /* Keepalive: send IAC NOP every ~30s to probe connection.
+             * SLIRP doesn't propagate external TCP close to the internal
+             * mTCP socket, so the socket stays ESTABLISHED forever.
+             * If the external client is gone, the NOP send will eventually
+             * cause SLIRP to RST the internal connection. */
+            {
+                unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                unsigned long idle = now - p->last_rx_tick;
+                unsigned long age = now - p->conn_tick;
+
+                /* Send IAC NOP keepalive every ~10 seconds of idle */
+                if (idle > 182UL && (idle % 182UL) < 2UL) {
+                    static unsigned char nop[2] = { 0xFF, 0xF1 }; /* IAC NOP */
+                    telnet_send_raw(p, nop, 2);
+                }
+
+                /* Disconnect detection */
+                if (p->sock->isClosed() ||
+                    (age > 91UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting())) {
+                    p->sock->close();
+                    TcpSocketMgr::freeSocket(p->sock);
+                    p->sock = NULL;
+                    ring_init(&p->rx);
+                    at_send_no_carrier(i);
+                    if (p->listenSock)
+                        p->mode = PORT_LISTEN;
+                    else
+                        p->mode = PORT_DISC;
+                }
             }
             break;
         }
@@ -194,6 +294,65 @@ void do_mtcp_poll(void)
         case PORT_DISC:
         default:
             break;
+        }
+    }
+
+    /* Flush debug log to disk if file is open and DOS I/O is safe.
+     * Safe when: g_dos_safe=1 (INT 28h context — DOS is idle, file I/O OK)
+     *         or InDOS=0 (no DOS call in progress, e.g. INT 14h from user code)
+     *         or g_int14_safe=1 (INT 14h caller context — software interrupt,
+     *            user code invoked us so DOS I/O is safe).
+     * Note: during INT 28h, InDOS is typically 1 (DOS is inside a keyboard read),
+     * so we must check g_dos_safe separately.
+     * We're on the private stack (SS == DS) so C library calls work. */
+    if (g_state.dbglog_fd >= 0 &&
+        (g_dos_safe || g_int14_safe ||
+         (g_indos_ptr != NULL && *g_indos_ptr == 0))) {
+        static unsigned short last_h = 0;
+        unsigned short h = g_state.dbglog_head;
+        if (h != last_h) {
+            unsigned written;
+            unsigned short saved_psp;
+
+            /* Switch to VMODEM's PSP so our file handle is valid.
+             * File handles are per-PSP; after TSR, the active PSP
+             * belongs to whatever program triggered this poll. */
+            {
+                unsigned short our_psp = g_state.our_psp;
+                __asm {
+                    mov ah, 51h
+                    int 21h
+                    mov saved_psp, bx
+                    mov bx, our_psp
+                    mov ah, 50h
+                    int 21h
+                }
+            }
+
+            if (h > last_h) {
+                _dos_write(g_state.dbglog_fd,
+                           &g_state.dbglog[last_h],
+                           h - last_h, &written);
+            } else {
+                /* Buffer wrapped */
+                _dos_write(g_state.dbglog_fd,
+                           &g_state.dbglog[last_h],
+                           DBGLOG_SIZE - last_h, &written);
+                if (h > 0)
+                    _dos_write(g_state.dbglog_fd,
+                               g_state.dbglog,
+                               h, &written);
+            }
+            _dos_commit(g_state.dbglog_fd);
+
+            /* Restore original PSP */
+            __asm {
+                mov bx, saved_psp
+                mov ah, 50h
+                int 21h
+            }
+
+            last_h = h;
         }
     }
 }

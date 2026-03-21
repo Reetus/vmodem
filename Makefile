@@ -59,13 +59,13 @@ TCP_OBJS = packet.obj arp.obj eth.obj ip.obj ipasm.obj &
            dns.obj timer.obj trace.obj
 
 # VMODEM application objects
-VMODEM_OBJS = vmodem.obj int14.obj int8.obj poll.obj telnet.obj ringbuf.obj
+VMODEM_OBJS = vmodem.obj int14.obj int8.obj poll.obj telnet.obj ringbuf.obj atcmd.obj
 
 # -------------------------------------------------------------------------
 # Default target
 # -------------------------------------------------------------------------
 
-all : vmodem.exe vmodemctl.exe vmodtest.exe comdiag.exe .symbolic
+all : vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe .symbolic
     @echo Build complete.
 
 # -------------------------------------------------------------------------
@@ -125,11 +125,15 @@ vmodem.obj  : vmodem.c  vmodem.h vmodem.cfg
 ringbuf.obj : ringbuf.c vmodem.h vmodem.cfg
 telnet.obj  : telnet.c  vmodem.h vmodem.cfg
 int14.obj   : int14.c   vmodem.h vmodem.cfg
+fossil.obj  : fossil.asm
+    wasm $(asm_opts) -fo=fossil.obj fossil
+
+atcmd.obj   : atcmd.c   vmodem.h vmodem.cfg
 int8.obj    : int8.c    vmodem.h vmodem.cfg
 
-# vmodemctl does NOT need mTCP headers; compile with minimal options
-vmodemctl.obj : vmodemctl.c
-    wpp vmodemctl -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
+# vmodctl does NOT need mTCP headers; compile with minimal options
+vmodctl.obj : vmodctl.c
+    wpp vmodctl -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
 
 # vmodtest: standalone DOS test utility (INT 14h / INT 2Fh only, no mTCP)
 vmodtest.obj : vmodtest.c
@@ -138,6 +142,10 @@ vmodtest.obj : vmodtest.c
 # comdiag: standalone COM port diagnostic utility (no mTCP)
 comdiag.obj : comdiag.c
     wpp comdiag -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
+
+# fosschk: FOSSIL driver detection checker (no mTCP)
+fosschk.obj : fosschk.c
+    wpp fosschk -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
 
 # -------------------------------------------------------------------------
 # Link VMODEM.EXE
@@ -150,7 +158,7 @@ vmodem.exe : $(VMODEM_OBJS) $(TCP_OBJS)
         option eliminate &
         option stack=2048 &
         name $@ &
-        file vmodem.obj,int14.obj,int8.obj,poll.obj,telnet.obj,ringbuf.obj &
+        file vmodem.obj,int14.obj,int8.obj,poll.obj,telnet.obj,ringbuf.obj,atcmd.obj &
         file packet.obj,arp.obj,eth.obj,ip.obj,ipasm.obj &
         file tcp.obj,tcpsockm.obj,udp.obj,utils.obj &
         file dns.obj,timer.obj,trace.obj
@@ -159,13 +167,13 @@ vmodem.exe : $(VMODEM_OBJS) $(TCP_OBJS)
 # Link VMODEMCTL.EXE
 # -------------------------------------------------------------------------
 
-vmodemctl.exe : vmodemctl.obj
+vmodctl.exe : vmodctl.obj
     wlink &
         system dos &
         option map &
         option eliminate &
         name $@ &
-        file vmodemctl.obj
+        file vmodctl.obj
 
 vmodtest.exe : vmodtest.obj
     wlink &
@@ -183,14 +191,26 @@ comdiag.exe : comdiag.obj
         name $@ &
         file comdiag.obj
 
+fosschk.exe : fosschk.obj
+    wlink &
+        system dos &
+        option map &
+        option eliminate &
+        name $@ &
+        file fosschk.obj
+
 # -------------------------------------------------------------------------
 # Clean
 # -------------------------------------------------------------------------
 
-install : vmodem.exe vmodemctl.exe vmodtest.exe comdiag.exe .symbolic
-    @cp vmodem.exe vmodemctl.exe vmodtest.exe comdiag.exe ../dosenv/vmodem/
+install : vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe .symbolic
+    @cp vmodem.exe ../dosenv/vmodem/VMODEM.EXE
+    @cp vmodctl.exe ../dosenv/vmodem/VMODCTL.EXE
+    @cp vmodtest.exe ../dosenv/vmodem/VMODTEST.EXE
+    @cp comdiag.exe ../dosenv/vmodem/COMDIAG.EXE
+    @cp fosschk.exe ../dosenv/vmodem/FOSSCHK.EXE
     @echo Installed to ../dosenv/vmodem/
 
 clean : .symbolic
-    @rm -f *.obj *.o *.map *.err vmodem.exe vmodemctl.exe vmodtest.exe comdiag.exe
+    @rm -f *.obj *.o *.map *.err vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe
     @echo Clean done.

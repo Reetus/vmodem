@@ -1,8 +1,9 @@
 /*
  * vmodem.h - VMODEM TSR: shared structures, defines, and externs
  *
- * VMODEM intercepts INT 14h (BIOS serial I/O) and routes traffic over
- * TCP/IP using the mTCP library.  Up to 4 COM ports are supported.
+ * VMODEM is a FOSSIL driver (FSC-0015) that intercepts INT 14h and
+ * routes serial traffic over TCP/IP using the mTCP library.
+ * Up to 4 COM ports are supported.
  *
  * Memory model: small (-ms).  All mTCP near-heap allocations live in
  * DGROUP alongside our static data, so everything stays resident in one
@@ -39,6 +40,7 @@
 #define MUX_DISCONNECT   0x03   /* CX=port(0-3)                          */
 #define MUX_STATUS       0x04   /* ES:BX→StatusBlock buffer (128 bytes)  */
 #define MUX_POLL         0x05   /* trigger one do_mtcp_poll() cycle      */
+#define MUX_DEBUGLOG     0x06   /* ES:BX→buffer, CX=size; returns log    */
 #define MUX_UNLOAD       0xFF   /* restore vectors, mark unloaded        */
 
 /* Telnet IAC parser states */
@@ -118,6 +120,8 @@ typedef struct {
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
     unsigned char  _pad0;       /* explicit pad: keep struct size even for -zp2 */
+    unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
+    unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
 } PortState;
 
 /* -----------------------------------------------------------------------
@@ -128,7 +132,19 @@ typedef struct {
  * the INT 2Fh installation check.
  * --------------------------------------------------------------------- */
 
+/*
+ * FOSSIL_STUB_SIZE: the FOSSIL signature stub is built dynamically at
+ * runtime in g_state.fossil_stub[].  Layout:
+ *   +0: EB 07        jmp short past_sig
+ *   +2: 90 90 90 90  nops
+ *   +6: 54 19        dw 1954h  (FOSSIL signature, little-endian)
+ *   +8: 1B           db 1Bh    (max function number)
+ *   +9: EA xx xx xx xx  jmp far seg:off  (to int14_real_handler)
+ */
+#define FOSSIL_STUB_SIZE 14
+
 typedef struct {
+    unsigned char  fossil_stub[FOSSIL_STUB_SIZE]; /* MUST be first — IVT points here */
     char           sig[VMODEM_SIG_LEN]; /* "VMODEM10" — detection sentinel */
     unsigned short our_seg;     /* DS value at install time (sanity check) */
     unsigned char  busy;        /* mTCP polling re-entrancy guard          */
@@ -141,6 +157,15 @@ typedef struct {
     unsigned short tcp_pend_outgoing; /* debug: Tcp::Pending_Outgoing snapshot */
     unsigned char  active_sockets;   /* debug: TcpSocketMgr::getActiveSockets() */
     unsigned char  poll_phase;       /* debug: which step of do_mtcp_poll we're in */
+
+    /* Debug log — circular text buffer + optional file output */
+    #define DBGLOG_SIZE 2048
+    char           dbglog[DBGLOG_SIZE];
+    unsigned short dbglog_head;          /* next write position */
+    unsigned short dbglog_count;         /* bytes in buffer */
+    short          dbglog_fd;            /* DOS file handle, -1 if none */
+    unsigned short our_psp;              /* VMODEM's PSP segment (for file I/O from TSR) */
+
     PortState      ports[MAX_PORTS];
 } VModemState;
 
@@ -205,6 +230,10 @@ extern void (__interrupt __far *old_int2f)(void);
  * Function prototypes
  * --------------------------------------------------------------------- */
 
+/* vmodem.c - debug log */
+void dbg(const char *msg);
+void dbg_hex(const char *prefix, unsigned char val);
+
 /* vmodem.c - IP parsing helper */
 int parse_ipaddr(const char *str, IpAddr_t ip);  /* 0=ok, -1=not an IP */
 
@@ -219,15 +248,31 @@ void telnet_on_connect(int port_idx);
 int  telnet_filter(PortState *p, unsigned char b);
 void telnet_send_byte(PortState *p, unsigned char b);
 void telnet_send_raw(PortState *p, unsigned char *buf, int len);
+void telnet_send_text(int port_idx, const char *msg);
 
 /* int14.c */
-void __interrupt __far int14_handler(void);
+extern "C" {
+    void __interrupt __far int14_real_handler(void);  /* FOSSIL INT 14h handler */
+}
+int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
 
 /* int8.c */
 void __interrupt __far int1c_handler(void);
 void __interrupt __far int28_handler(void);
 void __interrupt __far int2f_handler(void);
 void do_mtcp_poll(void);
+void poll_on_priv_stack(void);
+
+/* atcmd.c - AT command interpreter */
+void at_init(int port_idx);
+int  at_input(int port_idx, unsigned char b);  /* 1=consumed, 0=pass to TCP */
+void at_send_ring(int port_idx);
+void at_send_connect(int port_idx);
+void at_send_no_carrier(int port_idx);
+unsigned char at_get_s0(int port_idx);
+unsigned char at_is_ringing(int port_idx);
+unsigned char at_is_connect_pending(int port_idx);
+void at_check_ring(int port_idx);
 
 /* vmodem.c - control commands (callable from INT 2Fh handler) */
 void cmd_listen(int port_idx, unsigned short tcp_port);

@@ -207,6 +207,39 @@ int main(void)
             printf("\n");
         }
 
+        /* FOSSIL detection (same method BBS software uses) */
+        {
+            void (__interrupt __far *vec14)(void) = _dos_getvect(0x14);
+            unsigned short __far *sigptr = (unsigned short __far *)vec14;
+            unsigned char __far *bptr = (unsigned char __far *)vec14;
+            unsigned short sig = sigptr[3];  /* word at offset +6 */
+            unsigned char maxf = bptr[8];    /* byte at offset +8 */
+
+            printf("--------------------------------------------------------\n");
+            printf("FOSSIL check: INT 14h -> %04X:%04X\n",
+                   FP_SEG(vec14), FP_OFF(vec14));
+            printf("  Bytes at vector: %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   bptr[0], bptr[1], bptr[2], bptr[3], bptr[4], bptr[5],
+                   bptr[6], bptr[7], bptr[8]);
+            printf("  Signature at +6: 0x%04X (%s)\n",
+                   sig, (sig == 0x1954) ? "FOSSIL FOUND" : "NOT FOSSIL");
+            if (sig == 0x1954)
+                printf("  Max function: 0x%02X\n", maxf);
+
+            /* Also try AH=04h init */
+            {
+                union REGS r;
+                r.h.ah = 0x04;
+                r.w.dx = 0;
+                r.w.bx = 0;
+                int86(0x14, &r, &r);
+                printf("  AH=04h init: AX=0x%04X BH=%d BL=0x%02X (%s)\n",
+                       r.w.ax, r.h.bh, r.h.bl,
+                       (r.w.ax == 0x1954) ? "OK" : "FAIL");
+            }
+            printf("\n");
+        }
+
         /* VMODEM status section */
         has_vmodem = vmodem_installed();
         if (has_vmodem) {

@@ -61,6 +61,9 @@ unsigned short g_save_ss;
 unsigned short g_save_sp;
 unsigned short g_save_bp;
 
+/* Flag: 1 when executing from INT 28h context (DOS file I/O is safe) */
+unsigned char g_dos_safe = 0;
+
 /* -----------------------------------------------------------------------
  * poll_on_priv_stack — switch to private stack, call do_mtcp_poll, restore.
  *
@@ -79,7 +82,7 @@ unsigned short g_save_bp;
 /* do_mtcp_poll() is in poll.c (separate TU) so the compiler can't inline it.
  * No need for volatile function pointer. */
 
-static void poll_on_priv_stack(void)
+void poll_on_priv_stack(void)
 {
     __asm {
         mov  word ptr g_save_bp, bp
@@ -151,6 +154,7 @@ void __interrupt __far int28_handler(void)
     }
 
     g_state.busy = 1;
+    g_dos_safe = 1;
 
     /*
      * Enable interrupts so IRQ 3 (NE2000 packet driver) can fire during
@@ -163,6 +167,7 @@ void __interrupt __far int28_handler(void)
     poll_on_priv_stack();
 
     _disable();
+    g_dos_safe = 0;
     g_state.busy = 0;
 
     _chain_intr(old_int28);
@@ -286,6 +291,37 @@ void __interrupt __far int2f_handler(void)
         /* ES:BX → caller-provided StatusBlock buffer */
         cmd_status((StatusBlock __far *)MK_FP(orig_es, orig_bx));
         break;
+
+    case MUX_DEBUGLOG:
+    {
+        /* ES:BX → caller buffer, CX = buffer size.
+         * Copy debug log to caller's buffer, return AX = bytes copied. */
+        char __far *dst = (char __far *)MK_FP(orig_es, orig_bx);
+        unsigned short bufsz = orig_cx;
+        unsigned short count = g_state.dbglog_count;
+        unsigned short start;
+        unsigned short copied = 0;
+
+        if (count > bufsz)
+            count = bufsz;
+        if (count > 0) {
+            start = (g_state.dbglog_head + DBGLOG_SIZE - count) % DBGLOG_SIZE;
+            while (copied < count) {
+                dst[copied] = g_state.dbglog[start];
+                start = (start + 1) % DBGLOG_SIZE;
+                copied++;
+            }
+        }
+        /* Clear the log after reading */
+        g_state.dbglog_count = 0;
+        g_state.dbglog_head = 0;
+
+        __asm {
+            mov  ax, copied
+            mov  [bp+22], ax
+        }
+        break;
+    }
 
     case MUX_UNLOAD:
         /*

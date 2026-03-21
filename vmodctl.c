@@ -36,6 +36,7 @@
 #define MUX_CONNECT      0x02
 #define MUX_DISCONNECT   0x03
 #define MUX_STATUS       0x04
+#define MUX_DEBUGLOG     0x06
 #define MUX_UNLOAD       0xFF
 
 #define STATUS_BLOCK_MAGIC 0xA55A
@@ -340,6 +341,33 @@ int main(int argc, char *argv[])
                 printf("Bad /D: %s\n", arg); return 1;
             }
             do_disconnect(comn - 1);
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'G') {
+            /* /G — dump debug log */
+            union REGS r;
+            struct SREGS sr;
+            static char dbgbuf[2048];
+            unsigned short got;
+
+            segread(&sr);
+            sr.es = FP_SEG(dbgbuf);
+            r.h.ah = MUX_ID;
+            r.h.al = MUX_DEBUGLOG;
+            r.w.bx = FP_OFF(dbgbuf);
+            r.w.cx = sizeof(dbgbuf);
+            int86x(0x2F, &r, &r, &sr);
+            got = r.w.ax;
+            if (got > 0) {
+                unsigned short k;
+                for (k = 0; k < got; k++)
+                    putchar(dbgbuf[k]);
+                putchar('\n');
+            } else {
+                printf("(debug log empty)\n");
+            }
             did_something = 1;
             continue;
         }
