@@ -125,16 +125,6 @@ void poll_on_priv_stack(void)
 
 void __interrupt __far int1c_handler(void)
 {
-    /*
-     * Do NOT call do_mtcp_poll() from INT 1Ch (hardware interrupt context).
-     * The NE2000 packet driver's send_packet function fails when called
-     * from interrupt context, causing ARP replies and TCP packets to be
-     * dropped.  All mTCP network processing happens from INT 28h (DOS idle)
-     * or MUX_POLL (user context) where sends work correctly.
-     *
-     * We still chain to mTCP's Timer_tick_handler via old_int1c, which
-     * increments Timer_CurrentTicks needed for timeouts.
-     */
     _chain_intr(old_int1c);
 }
 

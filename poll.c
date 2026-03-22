@@ -151,6 +151,7 @@ void do_mtcp_poll(void)
                 p->mode = PORT_CONN;
                 p->conn_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
                 p->last_rx_tick = p->conn_tick;
+                p->last_tx_tick = p->conn_tick;
                 ring_init(&p->rx);
                 telnet_on_connect(i);
 
@@ -183,31 +184,9 @@ void do_mtcp_poll(void)
                 break;
             }
 
-            /* Detect DTR drop via direct UART I/O (e.g. Telix writes to MCR).
-             * Read real UART MCR register (base+4) — if DTR (bit 0) is low
-             * and we didn't lower it via FOSSIL AH=06h, the app hung up. */
-            {
-                unsigned short uart_base =
-                    *(volatile unsigned short __far *)MK_FP(0x0040, i * 2);
-                if (uart_base != 0) {
-                    unsigned char mcr = inp(uart_base + 4);
-                    if (!(mcr & 0x01)) {
-                        /* DTR dropped via direct I/O — disconnect */
-                        dbg("[DTR-IO]");
-                        fossil_flush_tx(i);
-                        p->sock->close();
-                        TcpSocketMgr::freeSocket(p->sock);
-                        p->sock = NULL;
-                        ring_init(&p->rx);
-                        at_send_no_carrier(i);
-                        if (p->listenSock)
-                            p->mode = PORT_LISTEN;
-                        else
-                            p->mode = PORT_DISC;
-                        break;
-                    }
-                }
-            }
+            /* DTR drop detection via direct UART I/O is disabled because
+             * INT 1Ch now uses MCR loopback mode to sync MSR with our
+             * virtual modem state.  DTR drop via FOSSIL AH=06h still works. */
 
             /* Flush any buffered TX data from the FOSSIL TX ring */
             fossil_flush_tx(i);
@@ -228,12 +207,21 @@ void do_mtcp_poll(void)
             while (p->sock->recvDataWaiting()) {
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
-                    static unsigned char logged_rx = 0;
                     int j;
                     p->last_rx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
-                    if (!logged_rx) {
-                        dbg("[RX-TCP]");
-                        logged_rx = 1;
+                    /* Log what telnet client sends (readable) */
+                    {
+                        static char rxc[2] = { 0, 0 };
+                        dbg("[RX:");
+                        for (j = 0; j < n; j++) {
+                            if (tmp[j] >= 0x20 && tmp[j] < 0x7F) {
+                                rxc[0] = (char)tmp[j];
+                                dbg(rxc);
+                            } else {
+                                dbg_hex("\\x", tmp[j]);
+                            }
+                        }
+                        dbg("]");
                     }
                     for (j = 0; j < n; j++) {
                         int b = telnet_filter(p, tmp[j]);
@@ -268,10 +256,39 @@ void do_mtcp_poll(void)
                 unsigned long idle = now - p->last_rx_tick;
                 unsigned long age = now - p->conn_tick;
 
-                /* Send IAC NOP keepalive every ~10 seconds of idle */
-                if (idle > 182UL && (idle % 182UL) < 2UL) {
+                /* Send IAC NOP keepalive every ~3 seconds of idle.
+                 * Start after 2s idle (36 ticks).  Repeat every 55 ticks (~3s).
+                 * This probes SLIRP quickly so it notices the dead external
+                 * connection and RSTs the internal socket. */
+                if (idle > 36UL && (idle % 55UL) < 2UL) {
                     static unsigned char nop[2] = { 0xFF, 0xF1 }; /* IAC NOP */
                     telnet_send_raw(p, nop, 2);
+                }
+
+                /* Idle timeout: disconnect if no TX or RX for configured period.
+                 * Handles BBS logoff (RA "Terminating Call" stops sending),
+                 * unattended sessions, and any case where both sides go silent. */
+                if (p->idle_timeout > 0) {
+                    unsigned long tx_idle = now - p->last_tx_tick;
+                    unsigned long rx_idle = idle;  /* already computed above */
+                    unsigned long timeout_ticks = (unsigned long)p->idle_timeout * 18UL;
+                    /* Both TX and RX must be idle */
+                    if (tx_idle > timeout_ticks && rx_idle > timeout_ticks) {
+                        dbg("[IDLE-TIMEOUT]");
+                        telnet_send_text(i, "\r\nClosing idle connection.\r\n");
+                        p->sock->close();
+                        /* Drive packets to push FIN through SLIRP */
+                        Tcp::drivePackets();
+                        TcpSocketMgr::freeSocket(p->sock);
+                        p->sock = NULL;
+                        ring_init(&p->rx);
+                        at_send_no_carrier(i);
+                        if (p->listenSock)
+                            p->mode = PORT_LISTEN;
+                        else
+                            p->mode = PORT_DISC;
+                        break;
+                    }
                 }
 
                 /* Disconnect detection */

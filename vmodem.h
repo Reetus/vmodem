@@ -122,6 +122,8 @@ typedef struct {
     unsigned char  _pad0;       /* explicit pad: keep struct size even for -zp2 */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
+    unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */
+    unsigned short idle_timeout;/* idle disconnect timeout in seconds (0=disabled) */
 } PortState;
 
 /* -----------------------------------------------------------------------

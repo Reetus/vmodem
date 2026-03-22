@@ -60,6 +60,8 @@ static unsigned char g_fossil_init[MAX_PORTS];  /* 1 = FOSSIL init'd on this por
 static unsigned char g_flow_ctrl[MAX_PORTS];    /* flow control flags */
 static unsigned char g_overrun[MAX_PORTS];      /* overrun flag */
 static unsigned char g_dtr[MAX_PORTS];          /* DTR state (1=raised) */
+/* last_tx_tick is now in PortState (vmodem.h) */
+static unsigned char g_purge_seen[MAX_PORTS];  /* set when AH=09h called while connected */
 
 /* Flag: set to 1 during INT 14h poll context — DOS I/O is safe because
  * this is a software interrupt from user code, not a hardware IRQ. */
@@ -158,6 +160,11 @@ static unsigned short fossil_status(int port_idx)
      * DCD tracks TCP connection state.
      * RI is set during ringing only. */
 
+    /* Detect BBS waiting for DCD drop (e.g. RA "Terminating Call").
+     * RA polls AH=03h in a tight loop waiting for DCD=0 but never
+     * sends ATH or drops DTR.  After ~500 consecutive status polls
+     * with no TX/RX activity (~1 second), close the connection. */
+
     /* CTS + DSR always on (null-modem), plus their delta bits */
     msr |= 0x31;  /* bit 0 DCTS + bit 4 CTS + bit 5 DSR */
     msr |= 0x02;  /* bit 1 DDSR */
@@ -168,8 +175,14 @@ static unsigned short fossil_status(int port_idx)
         /* Handshake in progress — DCD not yet asserted.
          * Real modems raise DCD only when CONNECT is sent. */
     } else if (p->mode == PORT_CONN && p->sock != NULL) {
-        msr |= 0x88;  /* DCD (bit 7) + DDCD (bit 3) */
+        /* Drop DCD after purge+status polling (BBS "Terminating Call").
+         * BBS sees DCD=0 and exits its DCD polling loop. */
+        if (g_purge_seen[port_idx] < 3)
+            msr |= 0x88;  /* DCD (bit 7) + DDCD (bit 3) */
     }
+
+    /* MSR sync via MCR loopback is handled by INT 1Ch handler (int8.c).
+     * This runs 18.2x/sec even when BBS is in tight loop polling MSR. */
 
     return ((unsigned short)lsr << 8) | (unsigned short)msr;
 }
@@ -286,14 +299,18 @@ void __interrupt __far int14_real_handler(void)
     p = &g_state.ports[port_idx];
     ret_ax = 0;
 
-    /* Log each unique FOSSIL function number once. Uses dbg() directly
-     * instead of dbg_hex() — dbg_hex references static const hex_chars[]
-     * which may not be accessible from ISR context. */
+    /* Log FOSSIL function calls.  Normally log each unique func once,
+     * but after AH=09h purge, log ALL calls to see what BBS does. */
     {
         static unsigned long seen_lo = 0;
         static char fb[7] = { 'F', ':', '0', '0', ' ', '\0', '\0' };
         static const char hx[] = "0123456789ABCDEF";
-        if (func < 0x20) {
+        if (g_purge_seen[port_idx]) {
+            /* After purge: log every call */
+            fb[2] = hx[(func >> 4) & 0x0F];
+            fb[3] = hx[func & 0x0F];
+            dbg(fb);
+        } else if (func < 0x20) {
             unsigned long bit = 1UL << func;
             if (!(seen_lo & bit)) {
                 seen_lo |= bit;
@@ -371,6 +388,7 @@ void __interrupt __far int14_real_handler(void)
     {
         unsigned char byte_to_send = (unsigned char)(orig_ax & 0xFF);
         int at_rc;
+        p->last_tx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
 
         /* Count all AH=01h calls to detect if BBS is writing after CONNECT */
         {
@@ -429,7 +447,8 @@ void __interrupt __far int14_real_handler(void)
      * ------------------------------------------------------------------ */
     case 0x02:
     {
-        int b = ring_get(&p->rx);
+        int b;
+        b = ring_get(&p->rx);
         if (b < 0) {
             /* No data — drive mTCP so we can receive packets and
              * accept connections.  INT 14h is a software interrupt
@@ -474,6 +493,22 @@ void __interrupt __far int14_real_handler(void)
             g_state.busy = 0;
         }
         at_check_ring(port_idx);
+
+        /* Detect BBS waiting for DCD drop (e.g. RA "Terminating Call").
+         * After AH=09h (purge) while connected, count AH=03h status polls.
+         * Once we've seen enough, just drop DCD — fossil_status() checks
+         * g_purge_seen and returns DCD=0.  The actual TCP close is handled
+         * by the idle timeout in the normal poll cycle (INT 28h). */
+        if (g_purge_seen[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
+            g_purge_seen[port_idx]++;
+            if (g_purge_seen[port_idx] >= 3) {
+                dbg("[DCD-DROP]");
+                /* DCD is now dropped via fossil_status() check.
+                 * Don't close socket here — let idle timeout handle it
+                 * from the INT 28h poll context where it's safe. */
+            }
+        }
+
         ret_ax = fossil_status(port_idx);
         break;
 
@@ -493,6 +528,13 @@ void __interrupt __far int14_real_handler(void)
         g_flow_ctrl[port_idx] = 0;
         g_overrun[port_idx] = 0;
         g_dtr[port_idx] = 1;  /* DTR raised */
+        g_purge_seen[port_idx] = 0;
+        {
+            unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            p->last_tx_tick = now;
+            p->last_rx_tick = now;
+            p->idle_timeout = 30;  /* default 30 second idle timeout */
+        }
         at_init(port_idx);
 
         /* Raise DTR on the real UART so direct-I/O MCR polling has
@@ -521,8 +563,25 @@ void __interrupt __far int14_real_handler(void)
      * DTR is NOT affected. Flush and close buffers.
      * ------------------------------------------------------------------ */
     case 0x05:
+        dbg("[DEINIT]");
         fossil_flush_tx(port_idx);
         g_fossil_init[port_idx] = 0;
+
+        /* If DTR is still raised and we have an active connection,
+         * the BBS is terminating without explicitly dropping DTR.
+         * Close the TCP connection so the telnet client sees the hangup. */
+        if (g_dtr[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
+            dbg("[DEINIT-DISC]");
+            p->sock->close();
+            TcpSocketMgr::freeSocket(p->sock);
+            p->sock = NULL;
+            ring_init(&p->rx);
+            at_send_no_carrier(port_idx);
+            if (p->listenSock)
+                p->mode = PORT_LISTEN;
+            else
+                p->mode = PORT_DISC;
+        }
         break;
 
     /* ------------------------------------------------------------------
@@ -592,6 +651,12 @@ void __interrupt __far int14_real_handler(void)
      * ------------------------------------------------------------------ */
     case 0x09:
         txring_init(&g_tx[port_idx]);
+        /* Only set purge_seen if not already in DCD-dropped state (>=3).
+         * BBS calls purge multiple times during "Terminating Call" —
+         * resetting would re-assert DCD and freeze the BBS. */
+        if (p->mode == PORT_CONN && p->sock != NULL
+            && g_purge_seen[port_idx] < 3)
+            g_purge_seen[port_idx] = 1;
         break;
 
     /* ------------------------------------------------------------------

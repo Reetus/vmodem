@@ -115,6 +115,21 @@ static void telnet_handle_option(PortState *p,
                                   unsigned char cmd,
                                   unsigned char opt)
 {
+    /* Log IAC commands for debugging */
+    {
+        static const char *cmd_names[] = { "SB", "WILL", "WONT", "DO", "DONT" };
+        if (cmd >= TEL_SB && cmd <= TEL_DONT) {
+            dbg("[IAC ");
+            dbg(cmd_names[cmd - TEL_SB]);
+            dbg_hex(" ", opt);
+            dbg("]");
+        } else {
+            dbg_hex("[IAC CMD=", cmd);
+            dbg_hex(" OPT=", opt);
+            dbg("]");
+        }
+    }
+
     switch (cmd) {
 
     case TEL_DO:
@@ -184,7 +199,9 @@ int telnet_filter(PortState *p, unsigned char b)
             p->iac_state = IAC_SAW_CMD;
             return -1;
         }
-        /* Any other command (IP, AO, SB, SE, NOP, …) — ignore */
+        /* Any other command (IP, AO, SB, SE, NOP, …) — log and ignore */
+        dbg_hex("[IAC single=", b);
+        dbg("]");
         p->iac_state = IAC_NORMAL;
         return -1;
 
