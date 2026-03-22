@@ -440,7 +440,7 @@ static void at_execute(int port_idx)
             }
             /* The rest of the line is the "number" — could be host:port.
              * For now we don't implement outbound dialing via AT commands;
-             * use VMODEMCTL /C instead.  Just respond OK. */
+             * use VMODCTL /C instead.  Just respond OK. */
             (void)dial_type;
             at_ok(port_idx);
             return;

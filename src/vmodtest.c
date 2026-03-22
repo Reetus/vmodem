@@ -10,7 +10,7 @@
  *                      directions.  Exits when "QUIT\r\n" is received or
  *                      after 60 seconds with no connection.
  *   VMODTEST /STATUS - print VMODEM port status via INT 2Fh (same as
- *                      VMODEMCTL /S but usable from within a test autoexec
+ *                      VMODCTL /S but usable from within a test autoexec
  *                      to confirm VMODEM loaded correctly).
  *
  * INT 14h calling convention:

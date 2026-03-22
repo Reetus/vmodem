@@ -1,9 +1,10 @@
 /*
- * vmodemctl.c - VMODEM Control Utility (VMODEMCTL.EXE)
+ * vmodctl.c - VMODEM Control Utility (VMODCTL.EXE)
  *
  * A lightweight companion to VMODEM.EXE that communicates with the
  * resident TSR via INT 2Fh (Multiplex Interrupt) to:
- *   - Add or change listen/connect settings without unloading the TSR
+ *   - Add or change listen settings without unloading the TSR
+ *   - Initialize/deinitialize FOSSIL on COM ports
  *   - Disconnect individual COM ports
  *   - Show current status
  *
@@ -11,11 +12,12 @@
  * DOS interrupt calls.  Compiled as a small model EXE.
  *
  * Usage:
- *   VMODEMCTL /L:n:port            Set COM n to listen on TCP port
- *   VMODEMCTL /C:n:host:port       Connect COM n outbound
- *   VMODEMCTL /D:n                 Disconnect COM n
- *   VMODEMCTL /S                   Show status
- *   VMODEMCTL /H                   Help
+ *   VMODCTL /I:n                 FOSSIL init COM n
+ *   VMODCTL /U:n                 FOSSIL deinit COM n
+ *   VMODCTL /L:n:port            Set COM n to listen on TCP port
+ *   VMODCTL /D:n                 Disconnect COM n
+ *   VMODCTL /S                   Show status
+ *   VMODCTL /H                   Help
  */
 
 #include <stdio.h>
@@ -24,59 +26,7 @@
 #include <dos.h>
 #include <i86.h>
 
-/* Replicate only the constants we need from vmodem.h
- * (we do not include vmodem.h because it pulls in mTCP headers) */
-
-#define VMODEM_SIG       "VMODEM10"
-#define VMODEM_SIG_LEN   8
-#define MAX_PORTS        4
-#define MUX_ID           0xC3
-#define MUX_INSTALL_CHK  0x00
-#define MUX_LISTEN       0x01
-#define MUX_CONNECT      0x02
-#define MUX_DISCONNECT   0x03
-#define MUX_STATUS       0x04
-#define MUX_DEBUGLOG     0x06
-#define MUX_UNLOAD       0xFF
-
-#define STATUS_BLOCK_MAGIC 0xA55A
-
-/* StatusBlock — MUST match vmodem.h exactly.
- * cmd_status() writes into this buffer via INT 2Fh; if the layout
- * doesn't match, it corrupts the stack and hangs the machine. */
-typedef struct {
-    unsigned short magic;
-    unsigned long  poll_count;
-    unsigned long  pkt_count;
-    unsigned short arp_count;
-    unsigned short ip_count;
-    unsigned long  arp_req_recv;
-    unsigned long  arp_rep_sent;
-    unsigned long  arp_req_sent;
-    unsigned long  arp_rep_recv;
-    unsigned char  buf_low_free;
-    unsigned char  buf_first;
-    unsigned char  buf_next;
-    unsigned char  _pad0;
-    unsigned long  pkts_recv;
-    unsigned long  pkts_sent;
-    unsigned long  pkts_send_errs;
-    unsigned long  pkts_dropped;
-    unsigned long  unhandled_count;
-    unsigned short first_unhandled_et;
-    unsigned short tcp_pend_sent;
-    unsigned short tcp_pend_outgoing;
-    unsigned char  active_sockets;
-    unsigned char  poll_phase;
-    struct {
-        unsigned char  mode;
-        unsigned char  initialized;
-        unsigned short localPort;
-        unsigned short remotePort;
-        unsigned char  remoteIP[4];
-        unsigned short rxCount;
-    } ports[MAX_PORTS];
-} StatusBlock;
+#include "vmodem_mux.h"
 
 static const char *mode_names[] = {
     "DISC", "LISTEN", "CONN", "RESOLVING", "CONNECTING", "???"
@@ -108,25 +58,6 @@ static int check_installed(unsigned short *seg_out, unsigned short *off_out)
     if (seg_out) *seg_out = sr.es;
     if (off_out) *off_out = (unsigned short)r.x.bx;
     return 1;
-}
-
-/* -----------------------------------------------------------------------
- * parse_ipaddr — simple dotted-decimal IPv4 parser
- * --------------------------------------------------------------------- */
-
-static int parse_ipaddr(const char *str, unsigned char ip[4])
-{
-    int parts = 0;
-    const char *p = str;
-
-    while (parts < 4) {
-        int octet = 0, digits = 0;
-        while (*p >= '0' && *p <= '9') { octet = octet*10 + (*p-'0'); p++; digits++; }
-        if (!digits || octet > 255) return -1;
-        ip[parts++] = (unsigned char)octet;
-        if (parts < 4) { if (*p != '.') return -1; p++; }
-    }
-    return (*p == '\0') ? 0 : -1;
 }
 
 /* -----------------------------------------------------------------------
@@ -218,30 +149,6 @@ static void do_listen(int com_idx, unsigned short tcp_port)
 }
 
 /* -----------------------------------------------------------------------
- * do_connect — send MUX_CONNECT to the TSR
- * --------------------------------------------------------------------- */
-
-static void do_connect(int com_idx, unsigned short tcp_port,
-                       const char *hostname)
-{
-    union REGS  r;
-    struct SREGS sr;
-
-    memset(&r, 0, sizeof(r));
-    memset(&sr, 0, sizeof(sr));
-
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_CONNECT;
-    r.x.cx = (unsigned short)com_idx;
-    r.x.dx = tcp_port;
-    sr.es  = FP_SEG(hostname);
-    r.x.si = FP_OFF(hostname);
-    int86x(0x2F, &r, &r, &sr);
-
-    printf("COM%d: connecting to %s:%u\n", com_idx + 1, hostname, tcp_port);
-}
-
-/* -----------------------------------------------------------------------
  * do_fossil_init — call INT 14h AH=04h (FOSSIL init) on a COM port
  *
  * This triggers VMODEM to create the listen socket for the port,
@@ -309,25 +216,23 @@ static void do_disconnect(int com_idx)
 static void print_help(void)
 {
     printf(
-        "VMODEMCTL - Control utility for the VMODEM TSR\n"
+        "VMODCTL - Control utility for the VMODEM TSR\n"
         "\n"
-        "Usage: VMODEMCTL [options]\n"
+        "Usage: VMODCTL [options]\n"
         "\n"
         "  /I:n              FOSSIL init COM n (activates listen socket)\n"
         "  /U:n              FOSSIL deinit COM n\n"
         "  /L:n:port         Set COM n to listen on TCP port\n"
-        "  /C:n:host:port    Connect COM n outbound to host:port\n"
         "  /D:n              Disconnect COM n\n"
         "  /S                Show status of all ports\n"
         "  /G                Dump debug log\n"
         "  /H or /?          This help\n"
         "\n"
         "Examples:\n"
-        "  VMODEMCTL /I:1 /S        Init COM1 FOSSIL then show status\n"
-        "  VMODEMCTL /L:1:23        COM1 listens on Telnet port 23\n"
-        "  VMODEMCTL /C:2:bbs.example.com:23   COM2 connects outbound\n"
-        "  VMODEMCTL /D:1           Disconnect COM1\n"
-        "  VMODEMCTL /S             Show status\n"
+        "  VMODCTL /I:1 /S        Init COM1 FOSSIL then show status\n"
+        "  VMODCTL /L:1:23        COM1 listens on Telnet port 23\n"
+        "  VMODCTL /D:1           Disconnect COM1\n"
+        "  VMODCTL /S             Show status\n"
     );
 }
 
@@ -402,36 +307,6 @@ int main(int argc, char *argv[])
             port = (unsigned short)atoi(p + 2);
             if (!port) { printf("Bad port: %s\n", arg); return 1; }
             do_listen(comn - 1, port);
-            did_something = 1;
-            continue;
-        }
-
-        if (c == 'C' && arg[2] == ':') {
-            /* /C:n:host:port */
-            char *p = arg + 3;
-            int   comn = *p - '0';
-            char *colon1, *colon2, *q;
-            char  host[64];
-            unsigned short port;
-            int hlen;
-
-            if (comn < 1 || comn > 4 || p[1] != ':') {
-                printf("Bad /C: %s\n", arg); return 1;
-            }
-            colon1 = p + 2;
-            colon2 = NULL;
-            for (q = colon1; *q; q++) if (*q == ':') colon2 = q;
-            if (!colon2) { printf("Missing port: %s\n", arg); return 1; }
-
-            port  = (unsigned short)atoi(colon2 + 1);
-            hlen  = (int)(colon2 - colon1);
-            if (!port || hlen <= 0 || hlen >= 63) {
-                printf("Bad host/port: %s\n", arg); return 1;
-            }
-            memcpy(host, colon1, (unsigned)hlen);
-            host[hlen] = '\0';
-
-            do_connect(comn - 1, port, host);
             did_something = 1;
             continue;
         }

@@ -29,7 +29,7 @@
  *
  * INT 2Fh (Multiplex Interrupt)
  * -----------------------------
- * Provides a control interface for VMODEMCTL and for a second VMODEM
+ * Provides a control interface for VMODCTL and for a second VMODEM
  * invocation after the TSR is already installed.  See vmodem.h for the
  * MUX_* sub-function codes and register conventions.
  */
@@ -237,16 +237,6 @@ void __interrupt __far int2f_handler(void)
     case MUX_LISTEN:
         /* CX = COM port index (0-3), DX = TCP listen port */
         cmd_listen((int)orig_cx, (unsigned short)orig_dx);
-        break;
-
-    case MUX_CONNECT:
-        /*
-         * CX = COM port index, DX = TCP remote port,
-         * ES:SI → null-terminated hostname string
-         */
-        cmd_connect((int)orig_cx,
-                    (unsigned short)orig_dx,
-                    (char __far *)MK_FP(orig_es, orig_si));
         break;
 
     case MUX_DISCONNECT:

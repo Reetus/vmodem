@@ -164,7 +164,7 @@ vmodem.exe : $(VMODEM_OBJS) $(TCP_OBJS)
         file dns.obj,timer.obj,trace.obj
 
 # -------------------------------------------------------------------------
-# Link VMODEMCTL.EXE
+# Link VMODCTL.EXE
 # -------------------------------------------------------------------------
 
 vmodctl.exe : vmodctl.obj

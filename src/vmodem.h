@@ -24,25 +24,10 @@
  * --------------------------------------------------------------------- */
 
 #define VMODEM_VER_STR   "1.0"
-#define VMODEM_SIG       "VMODEM10"   /* 8-byte detection signature */
-#define VMODEM_SIG_LEN   8
 
-#define MAX_PORTS        4            /* COM1-COM4 */
+#include "vmodem_mux.h"          /* StatusBlock, MUX_*, MAX_PORTS, etc. */
+
 #define RING_SIZE        512          /* rx ring buffer size (power-of-2!) */
-
-/* INT 2Fh (Multiplex) handler ID.  Pick an ID unlikely to conflict. */
-#define MUX_ID           0xC3
-
-/* INT 2Fh sub-function codes (placed in AL when AH = MUX_ID) */
-#define MUX_INSTALL_CHK  0x00   /* AL→FFh if installed; ES:BX→VModemState */
-#define MUX_LISTEN       0x01   /* CX=port(0-3), DX=TCP port             */
-#define MUX_CONNECT      0x02   /* CX=port, DX=TCP port, ES:SI→host str  */
-#define MUX_DISCONNECT   0x03   /* CX=port(0-3)                          */
-#define MUX_STATUS       0x04   /* ES:BX→StatusBlock buffer (128 bytes)  */
-#define MUX_POLL         0x05   /* trigger one do_mtcp_poll() cycle      */
-#define MUX_DEBUGLOG     0x06   /* ES:BX→buffer, CX=size; returns log    */
-#define MUX_HUNT_LISTEN  0x07   /* CL=portMask, DX=TCP port              */
-#define MUX_UNLOAD       0xFF   /* restore vectors, mark unloaded        */
 
 /* Maximum hunt groups (shared listen across multiple COM ports) */
 #define MAX_HUNT_GROUPS  2
@@ -165,6 +150,8 @@ typedef struct {
     unsigned short tcp_pend_outgoing; /* debug: Tcp::Pending_Outgoing snapshot */
     unsigned char  active_sockets;   /* debug: TcpSocketMgr::getActiveSockets() */
     unsigned char  poll_phase;       /* debug: which step of do_mtcp_poll we're in */
+    unsigned char  eager_listen;     /* 1 = listen immediately, don't wait for AH=04h */
+    unsigned char  _pad2;
 
     /* Debug log — circular text buffer + optional file output */
     #define DBGLOG_SIZE 2048
@@ -185,46 +172,7 @@ typedef struct {
     } huntGroups[MAX_HUNT_GROUPS];
 } VModemState;
 
-/* -----------------------------------------------------------------------
- * StatusBlock - returned by MUX_STATUS to callers
- * --------------------------------------------------------------------- */
-
-#define STATUS_BLOCK_MAGIC 0xA55A
-
-typedef struct {
-    unsigned short magic;               /* STATUS_BLOCK_MAGIC */
-    unsigned long  poll_count;          /* debug: total poll calls */
-    unsigned long  pkt_count;           /* debug: packets processed */
-    unsigned short arp_count;           /* debug: ARP packets */
-    unsigned short ip_count;            /* debug: IP packets  */
-    /* mTCP ARP stats — read directly from Arp:: class statics */
-    unsigned long  arp_req_recv;        /* Arp::RequestsReceived */
-    unsigned long  arp_rep_sent;        /* Arp::RepliesSent */
-    unsigned long  arp_req_sent;        /* Arp::RequestsSent */
-    unsigned long  arp_rep_recv;        /* Arp::RepliesReceived */
-    unsigned char  buf_low_free;        /* Buffer_lowFreeCount */
-    unsigned char  buf_first;           /* Buffer_first (ring head) */
-    unsigned char  buf_next;            /* Buffer_next  (ring tail) */
-    unsigned char  _pad0;
-    unsigned long  pkts_recv;           /* Packets_received (packet driver) */
-    unsigned long  pkts_sent;           /* Packets_sent */
-    unsigned long  pkts_send_errs;      /* Packets_send_errs */
-    unsigned long  pkts_dropped;        /* Packets_dropped */
-    unsigned long  unhandled_count;     /* packets with unknown EtherType */
-    unsigned short first_unhandled_et;  /* EtherType of first unhandled pkt */
-    unsigned short tcp_pend_sent;       /* Tcp::Pending_Sent */
-    unsigned short tcp_pend_outgoing;   /* Tcp::Pending_Outgoing */
-    unsigned char  active_sockets;      /* TcpSocketMgr active count */
-    unsigned char  poll_phase;          /* which poll step we're in */
-    struct {
-        unsigned char mode;             /* PortMode value */
-        unsigned char initialized;
-        unsigned short localPort;
-        unsigned short remotePort;
-        unsigned char remoteIP[4];
-        unsigned short rxCount;         /* bytes waiting in rx ring */
-    } ports[MAX_PORTS];
-} StatusBlock;
+/* StatusBlock is defined in vmodem_mux.h (shared with vmodctl, comdiag) */
 
 /* -----------------------------------------------------------------------
  * Global resident data (defined in vmodem.c)
@@ -292,8 +240,6 @@ void at_check_ring(int port_idx);
 
 /* vmodem.c - control commands (callable from INT 2Fh handler) */
 void cmd_listen(int port_idx, unsigned short tcp_port);
-void cmd_connect(int port_idx, unsigned short tcp_port,
-                 char __far *hostname);
 void cmd_disconnect(int port_idx);
 void cmd_hunt_listen(unsigned char port_mask, unsigned short tcp_port);
 void cmd_status(StatusBlock __far *sb);

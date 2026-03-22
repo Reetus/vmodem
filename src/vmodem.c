@@ -2,9 +2,9 @@
  * vmodem.c - VMODEM TSR main entry point
  *
  * Responsibilities:
- *   1. Parse command-line arguments (/L /C /U /S /H)
+ *   1. Parse command-line arguments (/L /E /U /H)
  *   2. Detect whether the TSR is already loaded (via INT 2Fh)
- *   3. If loaded: route /L, /C commands to the resident TSR
+ *   3. If loaded: route /L commands to the resident TSR
  *   4. If not loaded: initialise mTCP, hook interrupts, go TSR
  *   5. Provide cmd_* implementations callable from the INT 2Fh handler
  *
@@ -158,74 +158,6 @@ void cmd_listen(int port_idx, unsigned short tcp_port)
 }
 
 /* -----------------------------------------------------------------------
- * cmd_connect — initiate outbound connection for a COM port
- * --------------------------------------------------------------------- */
-
-void cmd_connect(int port_idx, unsigned short tcp_port,
-                 char __far *hostname)
-{
-    PortState *p;
-    IpAddr_t   ip;
-    char       local[64];
-    int        i;
-
-    if (port_idx < 0 || port_idx >= MAX_PORTS || !hostname)
-        return;
-    p = &g_state.ports[port_idx];
-
-    /* Copy far hostname to near buffer */
-    for (i = 0; i < 63 && hostname[i]; i++)
-        local[i] = hostname[i];
-    local[i] = '\0';
-
-    strncpy(p->hostname, local, sizeof(p->hostname) - 1);
-    p->hostname[sizeof(p->hostname) - 1] = '\0';
-    p->remotePort  = tcp_port;
-    p->listenSock  = NULL;
-    p->initialized = 1;
-    cmd_disconnect(port_idx);
-
-    if (parse_ipaddr(local, ip) == 0) {
-        /* Direct IP connect (non-blocking) */
-        TcpSocket *s = TcpSocketMgr::getSocket();
-        if (!s) {
-            printf("VMODEM: no free socket for COM%d\n", port_idx + 1);
-            return;
-        }
-        s->setRecvBuffer(2048);
-        {
-            static unsigned short src_port = 1025;
-            if (src_port > 65000) src_port = 1025;
-            s->connectNonBlocking(src_port++, ip, tcp_port);
-        }
-        memcpy(p->remoteIP, ip, 4);
-        p->sock = s;
-        p->mode = PORT_CONNECTING;
-    } else {
-        /* Need DNS resolution */
-        IpAddr_t dummy;
-        int8_t rc = Dns::resolve(local, dummy, 1);
-        if (rc == 0) {
-            /* Already cached */
-            TcpSocket *s = TcpSocketMgr::getSocket();
-            if (s) {
-                s->setRecvBuffer(2048);
-                static unsigned short sp2 = 2000;
-                if (sp2 > 65000) sp2 = 2000;
-                s->connectNonBlocking(sp2++, dummy, tcp_port);
-                memcpy(p->remoteIP, dummy, 4);
-                p->sock = s;
-                p->mode = PORT_CONNECTING;
-            }
-        } else {
-            p->sock = NULL;
-            p->mode = PORT_RESOLVING;
-        }
-    }
-    ring_init(&p->rx);
-}
-
-/* -----------------------------------------------------------------------
  * cmd_disconnect — close socket(s) for a COM port
  * --------------------------------------------------------------------- */
 
@@ -331,63 +263,6 @@ void cmd_status(StatusBlock __far *sb)
 }
 
 /* -----------------------------------------------------------------------
- * print_status — print port table to stdout
- * --------------------------------------------------------------------- */
-
-static void print_status(VModemState __far *rs)
-{
-    int i;
-    static const char *mnames[] = {
-        "DISC","LISTEN","CONN","RESOLVING","CONNECTING"
-    };
-
-    printf("\nVMODEM v%s  Status\n", VMODEM_VER_STR);
-    printf("%-6s %-11s %-8s %-20s %s\n",
-           "Port","Mode","LocalTCP","RemoteIP:Port","RxBuf");
-    printf("--------------------------------------------------------------\n");
-
-    for (i = 0; i < MAX_PORTS; i++) {
-        unsigned char  mode;
-        unsigned char  init;
-        unsigned short lp, rp;
-        unsigned char  rip[4];
-        unsigned short rxc;
-
-        if (rs) {
-            mode    = (unsigned char)rs->ports[i].mode;
-            init    = rs->ports[i].initialized;
-            lp      = rs->ports[i].localPort;
-            rp      = rs->ports[i].remotePort;
-            rip[0]  = rs->ports[i].remoteIP[0];
-            rip[1]  = rs->ports[i].remoteIP[1];
-            rip[2]  = rs->ports[i].remoteIP[2];
-            rip[3]  = rs->ports[i].remoteIP[3];
-            rxc     = rs->ports[i].rx.count;   /* far access to ring count */
-        } else {
-            mode    = (unsigned char)g_state.ports[i].mode;
-            init    = g_state.ports[i].initialized;
-            lp      = g_state.ports[i].localPort;
-            rp      = g_state.ports[i].remotePort;
-            rip[0]  = g_state.ports[i].remoteIP[0];
-            rip[1]  = g_state.ports[i].remoteIP[1];
-            rip[2]  = g_state.ports[i].remoteIP[2];
-            rip[3]  = g_state.ports[i].remoteIP[3];
-            rxc     = (unsigned short)ring_count(&g_state.ports[i].rx);
-        }
-
-        if (!init) {
-            printf("COM%d   not managed\n", i + 1);
-            continue;
-        }
-        if (mode > 4) mode = 0;
-        printf("COM%d   %-11s %-8u %u.%u.%u.%u:%-6u %u\n",
-               i + 1, mnames[mode], lp,
-               rip[0], rip[1], rip[2], rip[3], rp, rxc);
-    }
-    printf("\n");
-}
-
-/* -----------------------------------------------------------------------
  * do_unload — restore vectors via INT 2Fh MUX_UNLOAD
  * --------------------------------------------------------------------- */
 
@@ -430,16 +305,15 @@ static void do_unload(VModemState __far *rs)
 #define MAX_PORT_ARGS 4
 
 typedef struct {
-    int            type;     /* 0=listen, 1=connect, 2=hunt_listen */
+    int            type;     /* 0=listen, 2=hunt_listen */
     int            com;      /* 0-based first port */
     int            com_last; /* 0-based last port (-1 if single) */
     unsigned short tcp_port;
-    char           host[64];
 } PortArg;
 
-static int     want_status  = 0;
 static int     want_unload  = 0;
 static int     want_help    = 0;
+static int     eager_listen = 0;
 static int     num_port_args = 0;
 static PortArg port_args[MAX_PORT_ARGS];
 
@@ -450,15 +324,13 @@ static void print_help(void)
         "Usage: VMODEM [options]\n\n"
         "  /L:n:port         Listen on COM n for Telnet on TCP port\n"
         "  /L:n-m:port       Hunt group: share TCP port across COM n-m\n"
-        "  /C:n:host:port    Connect COM n outbound to host:port\n"
-        "  /S                Show status\n"
+        "  /E                Eager listen (don't wait for FOSSIL init)\n"
         "  /U                Unload resident copy\n"
         "  /H or /?          Help\n\n"
         "Examples:\n"
         "  VMODEM /L:1:23              COM1 listens on port 23\n"
+        "  VMODEM /L:1:23 /E           Listen immediately, no FOSSIL init needed\n"
         "  VMODEM /L:1-4:2323          Hunt group: COM1-4 share port 2323\n"
-        "  VMODEM /C:1:192.168.1.1:23 COM1 connects outbound\n"
-        "  VMODEM /S                   Show status\n"
         "  VMODEM /U                   Unload\n\n"
         "Requires: MTCP env var and packet driver loaded.\n",
         VMODEM_VER_STR
@@ -476,8 +348,8 @@ static int parse_args(int argc, char *argv[])
         if (c >= 'a' && c <= 'z') c -= 32;
 
         if (c == 'H' || c == '?') { want_help = 1; return 0; }
-        if (c == 'S') { want_status = 1; continue; }
         if (c == 'U') { want_unload = 1; continue; }
+        if (c == 'E') { eager_listen = 1; continue; }
 
         if (c == 'L' && arg[2] == ':') {
             char *p = arg + 3;
@@ -512,43 +384,6 @@ static int parse_args(int argc, char *argv[])
             port_args[num_port_args].com      = comn - 1;
             port_args[num_port_args].com_last = (comn_last > 0) ? comn_last - 1 : -1;
             port_args[num_port_args].tcp_port = port;
-            port_args[num_port_args].host[0]  = '\0';
-            num_port_args++;
-            continue;
-        }
-
-        if (c == 'C' && arg[2] == ':') {
-            char *p = arg + 3;
-            int   comn = *p - '0';
-            char *colon1, *colon2, *q;
-            char  host[64];
-            unsigned short port;
-            int hlen;
-
-            if (comn < 1 || comn > 4 || p[1] != ':') {
-                printf("Bad /C: %s\n", arg); return -1;
-            }
-            colon1 = p + 2;
-            colon2 = NULL;
-            for (q = colon1; *q; q++) if (*q == ':') colon2 = q;
-            if (!colon2) { printf("Missing port in: %s\n", arg); return -1; }
-
-            port = (unsigned short)atoi(colon2 + 1);
-            hlen = (int)(colon2 - colon1);
-            if (!port || hlen <= 0 || hlen >= 63) {
-                printf("Bad host/port: %s\n", arg); return -1;
-            }
-            memcpy(host, colon1, (unsigned)hlen);
-            host[hlen] = '\0';
-
-            if (num_port_args >= MAX_PORT_ARGS) {
-                printf("Too many port args.\n"); return -1;
-            }
-            port_args[num_port_args].type     = 1;
-            port_args[num_port_args].com      = comn - 1;
-            port_args[num_port_args].tcp_port = port;
-            strncpy(port_args[num_port_args].host, host, 63);
-            port_args[num_port_args].host[63] = '\0';
             num_port_args++;
             continue;
         }
@@ -579,14 +414,6 @@ int main(int argc, char *argv[])
 
     if (want_unload) { do_unload(installed); return 0; }
 
-    if (want_status) {
-        if (!installed)
-            printf("VMODEM is not installed.\n");
-        else
-            print_status(installed);
-        return 0;
-    }
-
     /* Send port commands to an already-loaded TSR */
     if (installed && num_port_args > 0) {
         printf("Sending commands to resident VMODEM...\n");
@@ -615,15 +442,6 @@ int main(int argc, char *argv[])
                 int86x(0x2F, &r, &r, &sr);
                 printf("  COM%d-%d: hunt group on TCP port %u\n",
                        pa->com + 1, pa->com_last + 1, pa->tcp_port);
-            } else {
-                r.h.al = MUX_CONNECT;
-                r.x.cx = (unsigned short)pa->com;
-                r.x.dx = pa->tcp_port;
-                sr.es  = FP_SEG(pa->host);
-                r.x.si = FP_OFF(pa->host);
-                int86x(0x2F, &r, &r, &sr);
-                printf("  COM%d: connecting to %s:%u\n",
-                       pa->com + 1, pa->host, pa->tcp_port);
             }
         }
         return 0;
@@ -632,7 +450,7 @@ int main(int argc, char *argv[])
     if (!num_port_args && !installed) { print_help(); return 0; }
 
     if (installed) {
-        printf("VMODEM already installed. Use /S for status.\n");
+        printf("VMODEM already installed. Use VMODCTL /S for status.\n");
         return 1;
     }
 
@@ -692,8 +510,9 @@ int main(int argc, char *argv[])
     /* Initialise resident state */
     memset(&g_state, 0, sizeof(g_state));
     memcpy(g_state.sig, VMODEM_SIG, VMODEM_SIG_LEN);
-    g_state.our_seg = FP_SEG(&g_state);
-    g_state.busy    = 0;
+    g_state.our_seg      = FP_SEG(&g_state);
+    g_state.busy         = 0;
+    g_state.eager_listen = (unsigned char)eager_listen;
 
     /* Set private stack top (near offset within DGROUP) */
     g_priv_stack_top = (unsigned short)FP_OFF(g_priv_stack) +
@@ -718,10 +537,45 @@ int main(int argc, char *argv[])
             cmd_hunt_listen(mask, pa->tcp_port);
             printf("  COM%d-%d: hunt group on TCP port %u\n",
                    pa->com + 1, pa->com_last + 1, pa->tcp_port);
-        } else {
-            cmd_connect(pa->com, pa->tcp_port, pa->host);
-            printf("  COM%d: connecting to %s:%u\n",
-                   pa->com + 1, pa->host, pa->tcp_port);
+        }
+    }
+
+    /* Eager listen: open listen sockets immediately instead of waiting
+     * for FOSSIL init (AH=04h).  Useful for standalone/test setups. */
+    if (eager_listen) {
+        for (i = 0; i < MAX_PORTS; i++) {
+            PortState *p = &g_state.ports[i];
+            if (p->initialized && p->localPort != 0 &&
+                p->listenSock == NULL && p->huntGroupIdx < 0) {
+                TcpSocket *ls = TcpSocketMgr::getSocket();
+                if (ls && ls->listen(p->localPort, 2048) == 0) {
+                    p->listenSock = ls;
+                    p->mode = PORT_LISTEN;
+                    printf("  COM%d: eager listen active\n", i + 1);
+                } else {
+                    if (ls) TcpSocketMgr::freeSocket(ls);
+                    printf("  COM%d: eager listen FAILED\n", i + 1);
+                }
+            }
+        }
+        /* Hunt groups */
+        for (i = 0; i < MAX_HUNT_GROUPS; i++) {
+            if (g_state.huntGroups[i].active &&
+                g_state.huntGroups[i].listenSock == NULL) {
+                TcpSocket *ls = TcpSocketMgr::getSocket();
+                if (ls && ls->listen(g_state.huntGroups[i].tcpPort, 2048) == 0) {
+                    int j;
+                    g_state.huntGroups[i].listenSock = ls;
+                    for (j = 0; j < MAX_PORTS; j++) {
+                        if (g_state.huntGroups[i].portMask & (1 << j))
+                            g_state.ports[j].mode = PORT_LISTEN;
+                    }
+                    printf("  Hunt group %d: eager listen active\n", i);
+                } else {
+                    if (ls) TcpSocketMgr::freeSocket(ls);
+                    printf("  Hunt group %d: eager listen FAILED\n", i);
+                }
+            }
         }
     }
 
