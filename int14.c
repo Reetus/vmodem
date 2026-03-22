@@ -299,73 +299,15 @@ void __interrupt __far int14_real_handler(void)
     p = &g_state.ports[port_idx];
     ret_ax = 0;
 
-    /* Log FOSSIL function calls.  Normally log each unique func once,
-     * but after AH=09h purge, log ALL calls to see what BBS does. */
-    {
-        static unsigned long seen_lo = 0;
-        static char fb[7] = { 'F', ':', '0', '0', ' ', '\0', '\0' };
-        static const char hx[] = "0123456789ABCDEF";
-        if (g_purge_seen[port_idx]) {
-            /* After purge: log every call */
-            fb[2] = hx[(func >> 4) & 0x0F];
-            fb[3] = hx[func & 0x0F];
-            dbg(fb);
-        } else if (func < 0x20) {
-            unsigned long bit = 1UL << func;
-            if (!(seen_lo & bit)) {
-                seen_lo |= bit;
-                fb[2] = hx[(func >> 4) & 0x0F];
-                fb[3] = hx[func & 0x0F];
-                dbg(fb);
-            }
-        }
-    }
-
-    /* Post-CONNECT trace: log transitions and interesting events.
-     * Tracks: RDA transitions, all non-03h calls, and first 8 AH=03h calls. */
-    {
-        static unsigned char post_conn_trace = 0;
-        static unsigned char last_rda = 255;  /* 255 = uninitialized */
-        static unsigned short trace_events = 0;
-        static unsigned char f03_count = 0;
-        static const char thx[] = "0123456789ABCDEF";
-
-        /* Start tracing once we see PORT_CONN and not ringing */
-        if (p->mode == PORT_CONN && !at_is_ringing(port_idx) && !post_conn_trace) {
-            post_conn_trace = 1;
-            trace_events = 0;
-            f03_count = 0;
-            last_rda = 255;
-            dbg("[TRACE-ON]");
-        }
-
-        if (post_conn_trace && trace_events < 60) {
-            unsigned short st = fossil_status(port_idx);
-            unsigned char rda = (st >> 8) & 0x01;
-
-            /* Log RDA transitions */
-            if (rda != last_rda) {
-                static char rb[10] = { 'R', 'D', 'A', ':', '0', ' ', '\0' };
-                rb[4] = rda ? '1' : '0';
-                dbg(rb);
-                last_rda = rda;
-                trace_events++;
-            }
-
-            /* Log all non-03h calls, plus first 8 03h calls */
-            if (func != 0x03 || f03_count < 8) {
-                static char tb[12] = { 'P', ':', '0', '0', ',', '0', '0', '0', '0', ' ', '\0', '\0' };
-                tb[2] = thx[(func >> 4) & 0x0F];
-                tb[3] = thx[func & 0x0F];
-                tb[5] = thx[(st >> 12) & 0x0F];
-                tb[6] = thx[(st >> 8) & 0x0F];
-                tb[7] = thx[(st >> 4) & 0x0F];
-                tb[8] = thx[st & 0x0F];
-                dbg(tb);
-                if (func == 0x03) f03_count++;
-                trace_events++;
-            }
-        }
+    /* Log FOSSIL function calls (compact: "F:XX ").
+     * Suppress AH=03h (status check) — called thousands of times/sec,
+     * floods the 2KB circular log and hides all other events. */
+    if (func != 0x03) {
+        static const char fhx[] = "0123456789ABCDEF";
+        static char fb[6] = { 'F', ':', '0', '0', ' ', '\0' };
+        fb[2] = fhx[(func >> 4) & 0x0F];
+        fb[3] = fhx[func & 0x0F];
+        dbg(fb);
     }
 
     switch (func) {
@@ -390,49 +332,18 @@ void __interrupt __far int14_real_handler(void)
         int at_rc;
         p->last_tx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
 
-        /* Count all AH=01h calls to detect if BBS is writing after CONNECT */
-        {
-            static unsigned short f01_count = 0;
-            f01_count++;
-            if (f01_count == 1 || (f01_count & 0x3FF) == 0) {
-                static const char chx[] = "0123456789ABCDEF";
-                static char cbuf[9] = { 'W', ':', '0', '0', '0', '0', ' ', '\0' };
-                cbuf[2] = chx[(f01_count >> 12) & 0x0F];
-                cbuf[3] = chx[(f01_count >> 8) & 0x0F];
-                cbuf[4] = chx[(f01_count >> 4) & 0x0F];
-                cbuf[5] = chx[f01_count & 0x0F];
-                dbg(cbuf);
-            }
-        }
-
         /* Try AT command parser first — it returns 1 if the byte was
          * consumed (command mode), 0 if we should send to TCP. */
         at_rc = at_input(port_idx, byte_to_send);
         if (at_rc == 0) {
             /* Data mode — send to TCP via TX ring */
             if (p->mode == PORT_CONN && p->sock != NULL) {
-                static unsigned short tx_count = 0;
-                if (tx_count == 0)
-                    dbg("[TX+]");  /* first TX byte in data mode */
-                tx_count++;
                 if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
                     fossil_flush_tx(port_idx);
                     if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
                         telnet_send_byte(p, byte_to_send);
                     }
                 }
-            } else {
-                static unsigned char tx_noconn = 0;
-                if (!tx_noconn) {
-                    tx_noconn = 1;
-                    dbg("[TX-NOCONN]");
-                }
-            }
-        } else {
-            static unsigned char tx_at = 0;
-            if (!tx_at) {
-                tx_at = 1;
-                dbg("[TX-AT]");
             }
         }
         ret_ax = fossil_status(port_idx);
@@ -546,6 +457,21 @@ void __interrupt __far int14_real_handler(void)
         }
         at_init(port_idx);
 
+        /* Start TCP listen if configured and not already listening.
+         * Deferred from cmd_listen() so connections can't arrive
+         * before the BBS has initialized the FOSSIL driver. */
+        if (p->localPort != 0 && p->listenSock == NULL && p->mode != PORT_CONN) {
+            TcpSocket *ls = TcpSocketMgr::getSocket();
+            if (ls && ls->listen(p->localPort, 2048) == 0) {
+                p->listenSock = ls;
+                p->mode = PORT_LISTEN;
+                dbg("[LISTEN-START]");
+            } else {
+                if (ls) TcpSocketMgr::freeSocket(ls);
+                dbg("[LISTEN-FAIL]");
+            }
+        }
+
         /* Raise DTR on the real UART so direct-I/O MCR polling has
          * a known baseline (apps like Telix drop DTR via port I/O). */
         {
@@ -605,18 +531,12 @@ void __interrupt __far int14_real_handler(void)
         }
 
         if (al == 0) {
-            /* DTR dropped — disconnect */
+            /* DTR dropped — disconnect.
+             * Don't close from INT 14h — packet driver can't transmit
+             * reliably here.  Set flag for next poll cycle (INT 28h). */
             if (p->mode == PORT_CONN && p->sock != NULL) {
-                fossil_flush_tx(port_idx);
-                p->sock->close();
-                TcpSocketMgr::freeSocket(p->sock);
-                p->sock = NULL;
-                ring_init(&p->rx);
-                at_send_no_carrier(port_idx);
-                if (p->listenSock)
-                    p->mode = PORT_LISTEN;
-                else
-                    p->mode = PORT_DISC;
+                dbg("[DTR-DISC]");
+                p->pending_close = 1;
             }
         } else {
             /* DTR raised — if ringing, answer the call */
@@ -654,12 +574,17 @@ void __interrupt __far int14_real_handler(void)
      * ------------------------------------------------------------------ */
     case 0x09:
         txring_init(&g_tx[port_idx]);
-        /* Only set purge_seen if not already in DCD-dropped state (>=3).
-         * BBS calls purge multiple times during "Terminating Call" —
-         * resetting would re-assert DCD and freeze the BBS. */
+        /* Only set purge_seen if not already in DCD-dropped state (>=3)
+         * and the connection has been up for at least ~10 seconds.
+         * BBS calls AH=09h during normal post-answer setup — without
+         * the age check, DCD would drop right after CONNECT. */
         if (p->mode == PORT_CONN && p->sock != NULL
-            && g_purge_seen[port_idx] < 3)
-            g_purge_seen[port_idx] = 1;
+            && g_purge_seen[port_idx] < 3) {
+            unsigned long age = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C)
+                                - p->conn_tick;
+            if (age > 182UL)  /* ~10 seconds */
+                g_purge_seen[port_idx] = 1;
+        }
         break;
 
     /* ------------------------------------------------------------------

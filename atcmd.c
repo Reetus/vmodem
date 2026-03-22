@@ -29,6 +29,8 @@
 #include <string.h>
 #include <conio.h>
 #include "vmodem.h"
+#include "tcp.h"
+#include "tcpsockm.h"
 
 #define AT_BUF_SIZE 128
 
@@ -214,10 +216,34 @@ void at_check_ring(int port_idx)
         return;
     }
 
+    /* Give up after 10 rings — host didn't answer */
+    if (at->rings_sent >= 10) {
+        dbg("[RING-TIMEOUT]");
+        at->ringing = 0;
+        at->rings_sent = 0;
+        telnet_send_text(port_idx, "\r\nThe host didn't answer :(\r\n");
+        Tcp::drivePackets();
+        if (p->sock) {
+            p->sock->close();
+            Tcp::drivePackets();
+            TcpSocketMgr::freeSocket(p->sock);
+            p->sock = NULL;
+        }
+        ring_init(&p->rx);
+        at_no_carrier(port_idx);
+        if (p->listenSock)
+            p->mode = PORT_LISTEN;
+        else
+            p->mode = PORT_DISC;
+        return;
+    }
+
     /* Send another RING */
     at_respond(port_idx, at->verbose ? "RING" : "2");
     at->rings_sent++;
     at->ring_tick = now;
+    /* Notify the telnet client */
+    telnet_send_text(port_idx, "RING...\r\n");
 }
 
 /* -----------------------------------------------------------------------
@@ -328,7 +354,6 @@ static void at_execute(int port_idx)
                 i++;
             at->cmd_mode = 0;
             at->plus_count = 0;
-            dbg_hex("Hm:", (unsigned char)p->mode);
             if (p->mode == PORT_CONN && p->sock != NULL) {
                 /* Close data socket but preserve listen socket */
                 fossil_flush_tx(port_idx);

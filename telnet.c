@@ -199,9 +199,7 @@ int telnet_filter(PortState *p, unsigned char b)
             p->iac_state = IAC_SAW_CMD;
             return -1;
         }
-        /* Any other command (IP, AO, SB, SE, NOP, …) — log and ignore */
-        dbg_hex("[IAC single=", b);
-        dbg("]");
+        /* Any other command (IP, AO, SB, SE, NOP, …) — ignore */
         p->iac_state = IAC_NORMAL;
         return -1;
 

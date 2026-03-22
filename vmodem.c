@@ -141,28 +141,18 @@ void dbg_hex(const char *prefix, unsigned char val)
 void cmd_listen(int port_idx, unsigned short tcp_port)
 {
     PortState *p;
-    TcpSocket *ls;
 
     if (port_idx < 0 || port_idx >= MAX_PORTS)
         return;
     p = &g_state.ports[port_idx];
     cmd_disconnect(port_idx);
 
-    ls = TcpSocketMgr::getSocket();
-    if (!ls) {
-        printf("VMODEM: no free socket for COM%d\n", port_idx + 1);
-        return;
-    }
-    if (ls->listen(tcp_port, 2048) != 0) {
-        printf("VMODEM: listen() failed for COM%d port %u\n",
-               port_idx + 1, tcp_port);
-        TcpSocketMgr::freeSocket(ls);
-        return;
-    }
-    p->listenSock  = ls;
+    /* Don't open the listen socket yet — wait for AH=04h (FOSSIL init).
+     * This prevents connections arriving before the BBS is ready. */
+    p->listenSock  = NULL;
     p->sock        = NULL;
     p->localPort   = tcp_port;
-    p->mode        = PORT_LISTEN;
+    p->mode        = PORT_DISC;
     p->initialized = 1;
     ring_init(&p->rx);
 }
@@ -246,17 +236,13 @@ void cmd_disconnect(int port_idx)
         return;
     p = &g_state.ports[port_idx];
     if (p->sock) {
-        p->sock->close();
-        TcpSocketMgr::freeSocket(p->sock);
-        p->sock = NULL;
+        /* Don't close directly — defer to INT 28h poll cycle where
+         * the packet driver can transmit reliably. */
+        dbg("[CMD-DISC]");
+        p->pending_close = 1;
     }
-    if (p->listenSock) {
-        p->listenSock->close();
-        TcpSocketMgr::freeSocket(p->listenSock);
-        p->listenSock = NULL;
-    }
-    p->mode = PORT_DISC;
-    ring_init(&p->rx);
+    /* Don't tear down listenSock or change mode here —
+     * the poll cycle POLL-CLOSE handler will do that. */
 }
 
 /* -----------------------------------------------------------------------
@@ -596,41 +582,20 @@ int main(int argc, char *argv[])
     /* Register unhandled packet handler for diagnostics */
     Packet_registerDefault(unhandled_pkt_handler);
 
-    /*
-     * Foreground network test: send ARP for the gateway and poll for a
-     * response.  This confirms the NE2000 can both send and receive
-     * packets while we're still running in the foreground (pre-TSR).
-     *
-     * Also dumps NE2000 register state for diagnostics.
-     */
+    /* Foreground ARP test: confirm network is working before going TSR. */
     {
         IpAddr_t gw;
         EthAddr_t gw_eth;
         unsigned long tstart, tnow;
-        unsigned char cr, bnry, curr;
         int got_reply = 0;
 
-        /* Use gateway IP from mTCP config (parsed by Utils::initStack) */
         gw[0] = Gateway[0]; gw[1] = Gateway[1];
         gw[2] = Gateway[2]; gw[3] = Gateway[3];
 
-        /* Dump NE2000 state BEFORE test */
-        cr = inp(0x300);
-        bnry = inp(0x303);
-        outp(0x300, (cr & 0x3F) | 0x40);  /* page 1 */
-        curr = inp(0x307);
-        outp(0x300, cr);
-        printf("NE2000 pre-test: CR=0x%02X BNRY=0x%02X CURR=0x%02X\n",
-               (unsigned)cr, (unsigned)bnry, (unsigned)curr);
-        printf("  pkts_recv=%lu pkts_sent=%lu\n",
-               Packets_received, Packets_sent);
-
-        /* Send ARP for the gateway */
         printf("ARP test: resolving gateway %u.%u.%u.%u ...\n",
                gw[0], gw[1], gw[2], gw[3]);
         Arp::resolve(gw, gw_eth);
 
-        /* Poll for ~5 seconds */
         tstart = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
         while (1) {
             PACKET_PROCESS_SINGLE;
@@ -638,40 +603,18 @@ int main(int argc, char *argv[])
             Tcp::drivePackets();
 
             if (Arp::resolve(gw, gw_eth) == 0) {
-                printf("ARP test: resolved! MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                       gw_eth[0], gw_eth[1], gw_eth[2],
-                       gw_eth[3], gw_eth[4], gw_eth[5]);
+                printf("ARP test: OK\n");
                 got_reply = 1;
                 break;
             }
 
             tnow = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
-            if (tnow - tstart > 18UL * 5) break;  /* 5 seconds */
+            if (tnow - tstart > 18UL * 5) break;
         }
 
         if (!got_reply)
             printf("ARP test: FAILED (no reply from gateway)\n");
 
-        /* Dump NE2000 state AFTER test and clean up */
-        outp(0x300, 0x22);    /* page 0, started, abort DMA */
-        bnry = inp(0x303);
-        outp(0x300, 0x62);    /* page 1 */
-        curr = inp(0x307);
-        outp(0x300, 0x22);    /* back to page 0 */
-        printf("NE2000 post-test: BNRY=0x%02X CURR=0x%02X\n",
-               (unsigned)bnry, (unsigned)curr);
-        printf("  pkts_recv=%lu pkts_sent=%lu\n",
-               Packets_received, Packets_sent);
-
-        /* Advance BNRY to CURR to discard any stale packets.
-         * This ensures a clean ring buffer before going TSR. */
-        if (bnry != curr) {
-            printf("  Discarding stale NE2000 ring packet(s)\n");
-            outp(0x303, curr);  /* BNRY = CURR */
-        }
-        /* Clear ISR and re-enable IMR */
-        outp(0x307, 0xFF);    /* clear all ISR bits */
-        outp(0x30F, 0x1F);    /* IMR: enable all */
         fflush(stdout);
     }
 

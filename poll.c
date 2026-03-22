@@ -163,6 +163,8 @@ void do_mtcp_poll(void)
                  * with ATA (or auto-answer via S0 register). */
                 at_send_ring(i);
 
+                /* Re-create listen socket so we can reject new
+                 * connections with a "busy" message during PORT_CONN. */
                 if (p->listenSock == NULL) {
                     TcpSocket *ls = TcpSocketMgr::getSocket();
                     if (ls) {
@@ -184,10 +186,42 @@ void do_mtcp_poll(void)
                 break;
             }
 
-            /* Pending close from INT 14h (DEINIT-DISC or INIT-DISC).
-             * Send farewell message and close here where the packet
-             * driver can transmit reliably (INT 28h context). */
-            if (p->pending_close) {
+            /* Reject incoming connections while a call is active.
+             * Accept, send "busy" message, then close immediately. */
+            if (p->listenSock) {
+                TcpSocket *ns = TcpSocketMgr::accept();
+                if (ns) {
+                    static unsigned char busy_msg[] =
+                        "\r\nLine is engaged. Please try again later.\r\n";
+                    ns->send(busy_msg, sizeof(busy_msg) - 1);
+                    Tcp::drivePackets();
+                    ns->close();
+                    Tcp::drivePackets();
+                    TcpSocketMgr::freeSocket(ns);
+                }
+            }
+
+            /* Drive ring/auto-answer from the poll cycle too.
+             * AH=03h also calls this, but if the BBS isn't polling
+             * (e.g. not running), we still need to send RINGs and
+             * eventually time out unanswered calls. */
+            at_check_ring(i);
+            /* at_check_ring may close the socket on ring timeout */
+            if (p->sock == NULL) {
+                if (p->listenSock)
+                    p->mode = PORT_LISTEN;
+                else
+                    p->mode = PORT_DISC;
+                break;
+            }
+
+            /* Pending close from INT 14h (DEINIT-DISC, INIT-DISC, DTR-DISC,
+             * or CMD-DISC).  Send farewell message and close here where
+             * the packet driver can transmit reliably.
+             * Safe from INT 28h (g_dos_safe) or INT 14h (g_int14_safe) —
+             * both are software-interrupt contexts with interrupts enabled,
+             * so the packet driver IRQ can fire. */
+            if (p->pending_close && (g_dos_safe || g_int14_safe)) {
                 dbg("[POLL-CLOSE]");
                 p->pending_close = 0;
                 telnet_send_text(i, "\r\nSession finished.\r\n");
@@ -198,48 +232,26 @@ void do_mtcp_poll(void)
                 p->sock = NULL;
                 ring_init(&p->rx);
                 at_send_no_carrier(i);
-                if (p->listenSock)
-                    p->mode = PORT_LISTEN;
-                else
-                    p->mode = PORT_DISC;
+                /* Close listen socket too — don't accept new connections
+                 * until AH=04h (FOSSIL init) re-creates it.  This prevents
+                 * a quick reconnect arriving before RA has restarted. */
+                if (p->listenSock) {
+                    p->listenSock->close();
+                    TcpSocketMgr::freeSocket(p->listenSock);
+                    p->listenSock = NULL;
+                }
+                p->mode = PORT_DISC;
                 break;
             }
 
             /* Flush any buffered TX data from the FOSSIL TX ring */
             fossil_flush_tx(i);
 
-            /* Log socket state once after connection */
-            {
-                static unsigned char logged_state = 0;
-                if (!logged_state) {
-                    static const char shx[] = "0123456789ABCDEF";
-                    static char sb[8] = { 'S', 'S', ':', '0', ' ', '\0' };
-                    unsigned char st = p->sock->state;
-                    sb[3] = shx[st & 0x0F];
-                    dbg(sb);
-                    logged_state = 1;
-                }
-            }
-
             while (p->sock->recvDataWaiting()) {
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
                     int j;
                     p->last_rx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
-                    /* Log what telnet client sends (readable) */
-                    {
-                        static char rxc[2] = { 0, 0 };
-                        dbg("[RX:");
-                        for (j = 0; j < n; j++) {
-                            if (tmp[j] >= 0x20 && tmp[j] < 0x7F) {
-                                rxc[0] = (char)tmp[j];
-                                dbg(rxc);
-                            } else {
-                                dbg_hex("\\x", tmp[j]);
-                            }
-                        }
-                        dbg("]");
-                    }
                     for (j = 0; j < n; j++) {
                         int b = telnet_filter(p, tmp[j]);
                         if (b >= 0)
@@ -247,19 +259,6 @@ void do_mtcp_poll(void)
                     }
                 } else {
                     break;
-                }
-            }
-
-            /* Log socket state changes for disconnect debugging */
-            {
-                static unsigned char last_state = 255;
-                unsigned char cur_state = p->sock->state;
-                if (cur_state != last_state) {
-                    static const char shx2[] = "0123456789ABCDEF";
-                    static char sb2[8] = { 'S', 'T', ':', '0', ' ', '\0' };
-                    sb2[3] = shx2[cur_state & 0x0F];
-                    dbg(sb2);
-                    last_state = cur_state;
                 }
             }
 
@@ -283,9 +282,8 @@ void do_mtcp_poll(void)
                 }
 
                 /* Idle timeout: disconnect if no TX or RX for configured period.
-                 * Handles BBS logoff (RA "Terminating Call" stops sending),
-                 * unattended sessions, and any case where both sides go silent. */
-                if (p->idle_timeout > 0) {
+                 * Only from INT 28h (g_dos_safe) — not from AH=03h poll. */
+                if (p->idle_timeout > 0 && g_dos_safe) {
                     unsigned long tx_idle = now - p->last_tx_tick;
                     unsigned long rx_idle = idle;  /* already computed above */
                     unsigned long timeout_ticks = (unsigned long)p->idle_timeout * 18UL;
@@ -308,9 +306,10 @@ void do_mtcp_poll(void)
                     }
                 }
 
-                /* Disconnect detection */
-                if (p->sock->isClosed() ||
-                    (age > 91UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting())) {
+                /* Disconnect detection — only from INT 28h context */
+                if (g_dos_safe &&
+                    (p->sock->isClosed() ||
+                    (age > 91UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
                     p->sock->close();
                     TcpSocketMgr::freeSocket(p->sock);
                     p->sock = NULL;
