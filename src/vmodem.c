@@ -246,6 +246,46 @@ void cmd_disconnect(int port_idx)
 }
 
 /* -----------------------------------------------------------------------
+ * cmd_hunt_listen — set up a hunt group (shared listen across COM ports)
+ * --------------------------------------------------------------------- */
+
+void cmd_hunt_listen(unsigned char port_mask, unsigned short tcp_port)
+{
+    int i, slot = -1;
+
+    /* Find a free hunt group slot */
+    for (i = 0; i < MAX_HUNT_GROUPS; i++) {
+        if (!g_state.huntGroups[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        printf("VMODEM: no free hunt group slots\n");
+        return;
+    }
+
+    g_state.huntGroups[slot].portMask   = port_mask;
+    g_state.huntGroups[slot].tcpPort    = tcp_port;
+    g_state.huntGroups[slot].listenSock = NULL;
+    g_state.huntGroups[slot].active     = 1;
+
+    /* Initialize each member port */
+    for (i = 0; i < MAX_PORTS; i++) {
+        if (!(port_mask & (1 << i)))
+            continue;
+        PortState *p = &g_state.ports[i];
+        p->listenSock    = NULL;
+        p->sock          = NULL;
+        p->localPort     = tcp_port;
+        p->mode          = PORT_DISC;
+        p->initialized   = 1;
+        p->huntGroupIdx  = (signed char)slot;
+        ring_init(&p->rx);
+    }
+}
+
+/* -----------------------------------------------------------------------
  * cmd_status — fill a StatusBlock for the caller
  * --------------------------------------------------------------------- */
 
@@ -390,8 +430,9 @@ static void do_unload(VModemState __far *rs)
 #define MAX_PORT_ARGS 4
 
 typedef struct {
-    int            type;     /* 0=listen, 1=connect */
-    int            com;      /* 0-based */
+    int            type;     /* 0=listen, 1=connect, 2=hunt_listen */
+    int            com;      /* 0-based first port */
+    int            com_last; /* 0-based last port (-1 if single) */
     unsigned short tcp_port;
     char           host[64];
 } PortArg;
@@ -408,13 +449,14 @@ static void print_help(void)
         "VMODEM v%s - Virtual Serial Port over Telnet/TCP\n\n"
         "Usage: VMODEM [options]\n\n"
         "  /L:n:port         Listen on COM n for Telnet on TCP port\n"
+        "  /L:n-m:port       Hunt group: share TCP port across COM n-m\n"
         "  /C:n:host:port    Connect COM n outbound to host:port\n"
         "  /S                Show status\n"
         "  /U                Unload resident copy\n"
         "  /H or /?          Help\n\n"
         "Examples:\n"
         "  VMODEM /L:1:23              COM1 listens on port 23\n"
-        "  VMODEM /L:1:23 /L:2:2323   COM1 and COM2 listen\n"
+        "  VMODEM /L:1-4:2323          Hunt group: COM1-4 share port 2323\n"
         "  VMODEM /C:1:192.168.1.1:23 COM1 connects outbound\n"
         "  VMODEM /S                   Show status\n"
         "  VMODEM /U                   Unload\n\n"
@@ -440,17 +482,35 @@ static int parse_args(int argc, char *argv[])
         if (c == 'L' && arg[2] == ':') {
             char *p = arg + 3;
             int comn = *p - '0';
+            int comn_last = -1;
             unsigned short port;
-            if (comn < 1 || comn > 4 || p[1] != ':') {
+            char *port_str;
+
+            if (comn < 1 || comn > 4) {
                 printf("Bad /L: %s\n", arg); return -1;
             }
-            port = (unsigned short)atoi(p + 2);
+
+            /* Check for range: /L:1-4:port */
+            if (p[1] == '-') {
+                comn_last = p[2] - '0';
+                if (comn_last < 1 || comn_last > 4 || comn_last < comn || p[3] != ':') {
+                    printf("Bad /L range: %s\n", arg); return -1;
+                }
+                port_str = p + 4;
+            } else if (p[1] == ':') {
+                port_str = p + 2;
+            } else {
+                printf("Bad /L: %s\n", arg); return -1;
+            }
+
+            port = (unsigned short)atoi(port_str);
             if (!port) { printf("Bad port in: %s\n", arg); return -1; }
             if (num_port_args >= MAX_PORT_ARGS) {
                 printf("Too many port args.\n"); return -1;
             }
-            port_args[num_port_args].type     = 0;
+            port_args[num_port_args].type     = (comn_last > 0) ? 2 : 0;
             port_args[num_port_args].com      = comn - 1;
+            port_args[num_port_args].com_last = (comn_last > 0) ? comn_last - 1 : -1;
             port_args[num_port_args].tcp_port = port;
             port_args[num_port_args].host[0]  = '\0';
             num_port_args++;
@@ -544,6 +604,17 @@ int main(int argc, char *argv[])
                 int86x(0x2F, &r, &r, &sr);
                 printf("  COM%d: listen on TCP port %u\n",
                        pa->com + 1, pa->tcp_port);
+            } else if (pa->type == 2) {
+                unsigned char mask = 0;
+                int j;
+                for (j = pa->com; j <= pa->com_last; j++)
+                    mask |= (1 << j);
+                r.h.al = MUX_HUNT_LISTEN;
+                r.x.cx = (unsigned short)mask;
+                r.x.dx = pa->tcp_port;
+                int86x(0x2F, &r, &r, &sr);
+                printf("  COM%d-%d: hunt group on TCP port %u\n",
+                       pa->com + 1, pa->com_last + 1, pa->tcp_port);
             } else {
                 r.h.al = MUX_CONNECT;
                 r.x.cx = (unsigned short)pa->com;
@@ -628,6 +699,10 @@ int main(int argc, char *argv[])
     g_priv_stack_top = (unsigned short)FP_OFF(g_priv_stack) +
                        (unsigned short)(PRIV_STACK_SIZE - 4);
 
+    /* Initialize huntGroupIdx for all ports */
+    for (i = 0; i < MAX_PORTS; i++)
+        g_state.ports[i].huntGroupIdx = -1;
+
     /* Process port arguments */
     for (i = 0; i < num_port_args; i++) {
         PortArg *pa = &port_args[i];
@@ -635,6 +710,14 @@ int main(int argc, char *argv[])
             cmd_listen(pa->com, pa->tcp_port);
             printf("  COM%d: listening on TCP port %u\n",
                    pa->com + 1, pa->tcp_port);
+        } else if (pa->type == 2) {
+            unsigned char mask = 0;
+            int j;
+            for (j = pa->com; j <= pa->com_last; j++)
+                mask |= (1 << j);
+            cmd_hunt_listen(mask, pa->tcp_port);
+            printf("  COM%d-%d: hunt group on TCP port %u\n",
+                   pa->com + 1, pa->com_last + 1, pa->tcp_port);
         } else {
             cmd_connect(pa->com, pa->tcp_port, pa->host);
             printf("  COM%d: connecting to %s:%u\n",

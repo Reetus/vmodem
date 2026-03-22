@@ -41,7 +41,11 @@
 #define MUX_STATUS       0x04   /* ES:BX→StatusBlock buffer (128 bytes)  */
 #define MUX_POLL         0x05   /* trigger one do_mtcp_poll() cycle      */
 #define MUX_DEBUGLOG     0x06   /* ES:BX→buffer, CX=size; returns log    */
+#define MUX_HUNT_LISTEN  0x07   /* CL=portMask, DX=TCP port              */
 #define MUX_UNLOAD       0xFF   /* restore vectors, mark unloaded        */
+
+/* Maximum hunt groups (shared listen across multiple COM ports) */
+#define MAX_HUNT_GROUPS  2
 
 /* Telnet IAC parser states */
 #define IAC_NORMAL       0   /* normal data mode */
@@ -113,6 +117,7 @@ typedef struct {
 
     /* Flags */
     unsigned char  initialized; /* 1 = this port is managed by VMODEM */
+    signed char    huntGroupIdx; /* -1 = standalone, 0..MAX_HUNT_GROUPS-1 = group */
 
     /* Telnet IAC parser state machine */
     unsigned char  iac_state;   /* IAC_NORMAL / IAC_SAW_FF / IAC_SAW_CMD */
@@ -120,6 +125,7 @@ typedef struct {
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
     unsigned char  pending_close;/* 1 = close socket on next poll cycle */
+    unsigned char  _pad1;       /* keep even alignment before conn_tick */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
     unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */
@@ -169,6 +175,14 @@ typedef struct {
     unsigned short our_psp;              /* VMODEM's PSP segment (for file I/O from TSR) */
 
     PortState      ports[MAX_PORTS];
+
+    /* Hunt groups: shared listen socket across multiple COM ports */
+    struct {
+        TcpSocket     *listenSock;  /* shared listen socket (NULL = inactive) */
+        unsigned short tcpPort;     /* TCP port to listen on */
+        unsigned char  portMask;    /* bitmask of member COM ports (bits 0-3) */
+        unsigned char  active;      /* 1 = configured */
+    } huntGroups[MAX_HUNT_GROUPS];
 } VModemState;
 
 /* -----------------------------------------------------------------------
@@ -281,6 +295,7 @@ void cmd_listen(int port_idx, unsigned short tcp_port);
 void cmd_connect(int port_idx, unsigned short tcp_port,
                  char __far *hostname);
 void cmd_disconnect(int port_idx);
+void cmd_hunt_listen(unsigned char port_mask, unsigned short tcp_port);
 void cmd_status(StatusBlock __far *sb);
 
 #endif /* _VMODEM_H */

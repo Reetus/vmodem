@@ -254,6 +254,12 @@ void __interrupt __far int2f_handler(void)
         cmd_disconnect((int)orig_cx);
         break;
 
+    case MUX_HUNT_LISTEN:
+        /* CL = port mask (bits 0-3), DX = TCP port */
+        cmd_hunt_listen((unsigned char)(orig_cx & 0xFF),
+                        (unsigned short)orig_dx);
+        break;
+
     case MUX_POLL:
         /*
          * Drive one poll cycle from caller's context.

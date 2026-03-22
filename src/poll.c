@@ -87,7 +87,55 @@ void do_mtcp_poll(void)
     Dns::drivePendingQuery();
 
     g_state.poll_phase = 5;  /* port servicing */
-    /* Step 2: Service each port */
+
+    /* Step 2a: Service hunt groups — accept and dispatch to first free port */
+    for (i = 0; i < MAX_HUNT_GROUPS; i++) {
+        TcpSocket *ns;
+        int target, j;
+
+        if (!g_state.huntGroups[i].active || g_state.huntGroups[i].listenSock == NULL)
+            continue;
+
+        ns = TcpSocketMgr::accept();
+        if (!ns)
+            continue;
+
+        /* Find first free port in the hunt group */
+        target = -1;
+        for (j = 0; j < MAX_PORTS; j++) {
+            if (!(g_state.huntGroups[i].portMask & (1 << j)))
+                continue;
+            if (g_state.ports[j].mode == PORT_LISTEN && g_state.ports[j].sock == NULL) {
+                target = j;
+                break;
+            }
+        }
+
+        if (target >= 0) {
+            PortState *tp = &g_state.ports[target];
+            tp->sock = ns;
+            tp->mode = PORT_CONN;
+            tp->conn_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            tp->last_rx_tick = tp->conn_tick;
+            tp->last_tx_tick = tp->conn_tick;
+            ring_init(&tp->rx);
+            telnet_on_connect(target);
+            telnet_send_text(target, "\r\nRinging the host, please wait...\r\n");
+            at_send_ring(target);
+            dbg("[HUNT-ACCEPT]");
+        } else {
+            /* All ports busy — reject */
+            static unsigned char busy_msg[] =
+                "\r\nAll lines are engaged. Please try again later.\r\n";
+            ns->send(busy_msg, sizeof(busy_msg) - 1);
+            Tcp::drivePackets();
+            ns->close();
+            Tcp::drivePackets();
+            TcpSocketMgr::freeSocket(ns);
+        }
+    }
+
+    /* Step 2b: Service each port */
     for (i = 0; i < MAX_PORTS; i++) {
         PortState *p = &g_state.ports[i];
 
@@ -141,7 +189,11 @@ void do_mtcp_poll(void)
 
         case PORT_LISTEN:
         {
-            TcpSocket *ns = TcpSocketMgr::accept();
+            TcpSocket *ns;
+            /* Hunt group members are handled by the hunt group loop above */
+            if (p->huntGroupIdx >= 0)
+                break;
+            ns = TcpSocketMgr::accept();
             if (ns) {
                 if (p->sock) {
                     p->sock->close();
@@ -187,8 +239,9 @@ void do_mtcp_poll(void)
             }
 
             /* Reject incoming connections while a call is active.
-             * Accept, send "busy" message, then close immediately. */
-            if (p->listenSock) {
+             * Hunt group members skip this — the hunt group loop
+             * dispatches to other free ports or rejects if all busy. */
+            if (p->huntGroupIdx < 0 && p->listenSock) {
                 TcpSocket *ns = TcpSocketMgr::accept();
                 if (ns) {
                     static unsigned char busy_msg[] =
@@ -208,10 +261,7 @@ void do_mtcp_poll(void)
             at_check_ring(i);
             /* at_check_ring may close the socket on ring timeout */
             if (p->sock == NULL) {
-                if (p->listenSock)
-                    p->mode = PORT_LISTEN;
-                else
-                    p->mode = PORT_DISC;
+                p->mode = PORT_DISC;
                 break;
             }
 
@@ -232,15 +282,16 @@ void do_mtcp_poll(void)
                 p->sock = NULL;
                 ring_init(&p->rx);
                 at_send_no_carrier(i);
-                /* Close listen socket too — don't accept new connections
-                 * until AH=04h (FOSSIL init) re-creates it.  This prevents
-                 * a quick reconnect arriving before RA has restarted. */
-                if (p->listenSock) {
-                    p->listenSock->close();
-                    TcpSocketMgr::freeSocket(p->listenSock);
-                    p->listenSock = NULL;
-                }
-                p->mode = PORT_DISC;
+                /* Keep the listen socket alive — RA's batch file will
+                 * loop back and restart RA, which calls AH=04h.
+                 * The port goes to PORT_LISTEN so it can accept new
+                 * connections once RA is ready (AH=04h ring/answer). */
+                if (p->listenSock)
+                    p->mode = PORT_LISTEN;
+                else if (p->huntGroupIdx >= 0)
+                    p->mode = PORT_LISTEN;
+                else
+                    p->mode = PORT_DISC;
                 break;
             }
 
@@ -298,10 +349,7 @@ void do_mtcp_poll(void)
                         p->sock = NULL;
                         ring_init(&p->rx);
                         at_send_no_carrier(i);
-                        if (p->listenSock)
-                            p->mode = PORT_LISTEN;
-                        else
-                            p->mode = PORT_DISC;
+                        p->mode = PORT_DISC;
                         break;
                     }
                 }
@@ -315,10 +363,7 @@ void do_mtcp_poll(void)
                     p->sock = NULL;
                     ring_init(&p->rx);
                     at_send_no_carrier(i);
-                    if (p->listenSock)
-                        p->mode = PORT_LISTEN;
-                    else
-                        p->mode = PORT_DISC;
+                    p->mode = PORT_DISC;
                 }
             }
             break;

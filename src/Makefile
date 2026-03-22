@@ -19,7 +19,7 @@
 # Paths
 # -------------------------------------------------------------------------
 
-MTCP_ROOT = ../mtcp/mTCP-src_2025-01-10
+MTCP_ROOT = ../../mtcp/mTCP-src_2025-01-10
 TCPLIB    = $(MTCP_ROOT)/TCPLIB
 TCPINC    = $(MTCP_ROOT)/TCPINC
 INC       = $(MTCP_ROOT)/INCLUDE
@@ -204,12 +204,12 @@ fosschk.exe : fosschk.obj
 # -------------------------------------------------------------------------
 
 install : vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe .symbolic
-    @cp vmodem.exe ../dosenv/vmodem/VMODEM.EXE
-    @cp vmodctl.exe ../dosenv/vmodem/VMODCTL.EXE
-    @cp vmodtest.exe ../dosenv/vmodem/VMODTEST.EXE
-    @cp comdiag.exe ../dosenv/vmodem/COMDIAG.EXE
-    @cp fosschk.exe ../dosenv/vmodem/FOSSCHK.EXE
-    @echo Installed to ../dosenv/vmodem/
+    @cp vmodem.exe ../../dosenv/vmodem/VMODEM.EXE
+    @cp vmodctl.exe ../../dosenv/vmodem/VMODCTL.EXE
+    @cp vmodtest.exe ../../dosenv/vmodem/VMODTEST.EXE
+    @cp comdiag.exe ../../dosenv/vmodem/COMDIAG.EXE
+    @cp fosschk.exe ../../dosenv/vmodem/FOSSCHK.EXE
+    @echo Installed to ../../dosenv/vmodem/
 
 clean : .symbolic
     @rm -f *.obj *.o *.map *.err vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe

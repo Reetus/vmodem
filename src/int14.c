@@ -460,7 +460,24 @@ void __interrupt __far int14_real_handler(void)
         /* Start TCP listen if configured and not already listening.
          * Deferred from cmd_listen() so connections can't arrive
          * before the BBS has initialized the FOSSIL driver. */
-        if (p->localPort != 0 && p->listenSock == NULL && p->mode != PORT_CONN) {
+        if (p->huntGroupIdx >= 0) {
+            /* Hunt group member — create shared listen socket if needed */
+            int hgi = p->huntGroupIdx;
+            if (hgi < MAX_HUNT_GROUPS && g_state.huntGroups[hgi].active &&
+                g_state.huntGroups[hgi].listenSock == NULL) {
+                TcpSocket *ls = TcpSocketMgr::getSocket();
+                if (ls && ls->listen(g_state.huntGroups[hgi].tcpPort, 2048) == 0) {
+                    g_state.huntGroups[hgi].listenSock = ls;
+                    dbg("[HUNT-LISTEN-START]");
+                } else {
+                    if (ls) TcpSocketMgr::freeSocket(ls);
+                    dbg("[HUNT-LISTEN-FAIL]");
+                }
+            }
+            if (p->mode != PORT_CONN)
+                p->mode = PORT_LISTEN;
+        } else if (p->localPort != 0 && p->listenSock == NULL && p->mode != PORT_CONN) {
+            /* Per-port listen (standalone) */
             TcpSocket *ls = TcpSocketMgr::getSocket();
             if (ls && ls->listen(p->localPort, 2048) == 0) {
                 p->listenSock = ls;
