@@ -184,9 +184,26 @@ void do_mtcp_poll(void)
                 break;
             }
 
-            /* DTR drop detection via direct UART I/O is disabled because
-             * INT 1Ch now uses MCR loopback mode to sync MSR with our
-             * virtual modem state.  DTR drop via FOSSIL AH=06h still works. */
+            /* Pending close from INT 14h (DEINIT-DISC or INIT-DISC).
+             * Send farewell message and close here where the packet
+             * driver can transmit reliably (INT 28h context). */
+            if (p->pending_close) {
+                dbg("[POLL-CLOSE]");
+                p->pending_close = 0;
+                telnet_send_text(i, "\r\nSession finished.\r\n");
+                Tcp::drivePackets();
+                p->sock->close();
+                Tcp::drivePackets();
+                TcpSocketMgr::freeSocket(p->sock);
+                p->sock = NULL;
+                ring_init(&p->rx);
+                at_send_no_carrier(i);
+                if (p->listenSock)
+                    p->mode = PORT_LISTEN;
+                else
+                    p->mode = PORT_DISC;
+                break;
+            }
 
             /* Flush any buffered TX data from the FOSSIL TX ring */
             fossil_flush_tx(i);

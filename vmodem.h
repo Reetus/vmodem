@@ -119,7 +119,7 @@ typedef struct {
     unsigned char  iac_cmd;     /* the command byte we saw (WILL/WONT/DO/DONT) */
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
-    unsigned char  _pad0;       /* explicit pad: keep struct size even for -zp2 */
+    unsigned char  pending_close;/* 1 = close socket on next poll cycle */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
     unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */

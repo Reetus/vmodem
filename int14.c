@@ -523,6 +523,14 @@ void __interrupt __far int14_real_handler(void)
         ring_init(&p->rx);
         txring_init(&g_tx[port_idx]);
 
+        /* If DCD was dropped (purge_seen >= 3) and the socket is still
+         * open, defer close to the poll cycle (INT 28h) where the packet
+         * driver can transmit reliably. */
+        if (g_purge_seen[port_idx] >= 3 && p->mode == PORT_CONN && p->sock != NULL) {
+            dbg("[INIT-DISC]");
+            p->pending_close = 1;
+        }
+
         /* Reset state */
         g_fossil_init[port_idx] = 1;
         g_flow_ctrl[port_idx] = 0;
@@ -534,6 +542,7 @@ void __interrupt __far int14_real_handler(void)
             p->last_tx_tick = now;
             p->last_rx_tick = now;
             p->idle_timeout = 30;  /* default 30 second idle timeout */
+            /* Don't clear pending_close here — poll cycle needs to see it */
         }
         at_init(port_idx);
 
@@ -572,15 +581,9 @@ void __interrupt __far int14_real_handler(void)
          * Close the TCP connection so the telnet client sees the hangup. */
         if (g_dtr[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
             dbg("[DEINIT-DISC]");
-            p->sock->close();
-            TcpSocketMgr::freeSocket(p->sock);
-            p->sock = NULL;
-            ring_init(&p->rx);
-            at_send_no_carrier(port_idx);
-            if (p->listenSock)
-                p->mode = PORT_LISTEN;
-            else
-                p->mode = PORT_DISC;
+            /* Don't close from INT 14h — packet driver can't transmit
+             * reliably here.  Set flag for next poll cycle (INT 28h). */
+            p->pending_close = 1;
         }
         break;
 
