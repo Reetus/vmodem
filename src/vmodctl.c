@@ -41,9 +41,33 @@
 
 #define STATUS_BLOCK_MAGIC 0xA55A
 
-/* Minimal StatusBlock mirroring vmodem.h */
+/* StatusBlock — MUST match vmodem.h exactly.
+ * cmd_status() writes into this buffer via INT 2Fh; if the layout
+ * doesn't match, it corrupts the stack and hangs the machine. */
 typedef struct {
     unsigned short magic;
+    unsigned long  poll_count;
+    unsigned long  pkt_count;
+    unsigned short arp_count;
+    unsigned short ip_count;
+    unsigned long  arp_req_recv;
+    unsigned long  arp_rep_sent;
+    unsigned long  arp_req_sent;
+    unsigned long  arp_rep_recv;
+    unsigned char  buf_low_free;
+    unsigned char  buf_first;
+    unsigned char  buf_next;
+    unsigned char  _pad0;
+    unsigned long  pkts_recv;
+    unsigned long  pkts_sent;
+    unsigned long  pkts_send_errs;
+    unsigned long  pkts_dropped;
+    unsigned long  unhandled_count;
+    unsigned short first_unhandled_et;
+    unsigned short tcp_pend_sent;
+    unsigned short tcp_pend_outgoing;
+    unsigned char  active_sockets;
+    unsigned char  poll_phase;
     struct {
         unsigned char  mode;
         unsigned char  initialized;
@@ -149,14 +173,25 @@ static void show_status(void)
             continue;
         }
         if (mode > 4) mode = 5;
-        printf("COM%d   %-11s %-8u %u.%u.%u.%u:%-5u  %u\n",
-               i + 1,
-               mode_names[mode],
-               sb.ports[i].localPort,
-               sb.ports[i].remoteIP[0], sb.ports[i].remoteIP[1],
-               sb.ports[i].remoteIP[2], sb.ports[i].remoteIP[3],
-               sb.ports[i].remotePort,
-               sb.ports[i].rxCount);
+        if (mode == 2) {
+            /* PORT_CONN — show remote IP:port */
+            printf("COM%d   %-11s %-8u %u.%u.%u.%u:%-5u  %u\n",
+                   i + 1,
+                   mode_names[mode],
+                   sb.ports[i].localPort,
+                   sb.ports[i].remoteIP[0], sb.ports[i].remoteIP[1],
+                   sb.ports[i].remoteIP[2], sb.ports[i].remoteIP[3],
+                   sb.ports[i].remotePort,
+                   sb.ports[i].rxCount);
+        } else {
+            /* DISC/LISTEN/RESOLVING/CONNECTING — no remote endpoint */
+            printf("COM%d   %-11s %-8u %-20s %u\n",
+                   i + 1,
+                   mode_names[mode],
+                   sb.ports[i].localPort,
+                   "-",
+                   sb.ports[i].rxCount);
+        }
     }
     printf("\n");
 }
@@ -207,6 +242,47 @@ static void do_connect(int com_idx, unsigned short tcp_port,
 }
 
 /* -----------------------------------------------------------------------
+ * do_fossil_init — call INT 14h AH=04h (FOSSIL init) on a COM port
+ *
+ * This triggers VMODEM to create the listen socket for the port,
+ * which is normally deferred until a BBS calls FOSSIL init.
+ * --------------------------------------------------------------------- */
+
+static void do_fossil_init(int com_idx)
+{
+    union REGS r;
+
+    memset(&r, 0, sizeof(r));
+    r.h.ah = 0x04;      /* FOSSIL init */
+    r.x.dx = (unsigned short)com_idx;
+    int86(0x14, &r, &r);
+
+    if (r.x.ax == 0x1954) {
+        printf("COM%d: FOSSIL initialized (signature 0x1954).\n",
+               com_idx + 1);
+    } else {
+        printf("COM%d: FOSSIL init failed (AX=0x%04X).\n",
+               com_idx + 1, r.x.ax);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * do_fossil_deinit — call INT 14h AH=05h (FOSSIL deinit) on a COM port
+ * --------------------------------------------------------------------- */
+
+static void do_fossil_deinit(int com_idx)
+{
+    union REGS r;
+
+    memset(&r, 0, sizeof(r));
+    r.h.ah = 0x05;      /* FOSSIL deinit */
+    r.x.dx = (unsigned short)com_idx;
+    int86(0x14, &r, &r);
+
+    printf("COM%d: FOSSIL deinitialized.\n", com_idx + 1);
+}
+
+/* -----------------------------------------------------------------------
  * do_disconnect — send MUX_DISCONNECT to the TSR
  * --------------------------------------------------------------------- */
 
@@ -237,13 +313,17 @@ static void print_help(void)
         "\n"
         "Usage: VMODEMCTL [options]\n"
         "\n"
+        "  /I:n              FOSSIL init COM n (activates listen socket)\n"
+        "  /U:n              FOSSIL deinit COM n\n"
         "  /L:n:port         Set COM n to listen on TCP port\n"
         "  /C:n:host:port    Connect COM n outbound to host:port\n"
         "  /D:n              Disconnect COM n\n"
         "  /S                Show status of all ports\n"
+        "  /G                Dump debug log\n"
         "  /H or /?          This help\n"
         "\n"
         "Examples:\n"
+        "  VMODEMCTL /I:1 /S        Init COM1 FOSSIL then show status\n"
         "  VMODEMCTL /L:1:23        COM1 listens on Telnet port 23\n"
         "  VMODEMCTL /C:2:bbs.example.com:23   COM2 connects outbound\n"
         "  VMODEMCTL /D:1           Disconnect COM1\n"
@@ -279,6 +359,28 @@ int main(int argc, char *argv[])
 
         if (c == 'S') {
             show_status();
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'I' && arg[2] == ':') {
+            /* /I:n — FOSSIL init (INT 14h AH=04h) */
+            int comn = arg[3] - '0';
+            if (comn < 1 || comn > 4) {
+                printf("Bad /I: %s\n", arg); return 1;
+            }
+            do_fossil_init(comn - 1);
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'U' && arg[2] == ':') {
+            /* /U:n — FOSSIL deinit (INT 14h AH=05h) */
+            int comn = arg[3] - '0';
+            if (comn < 1 || comn > 4) {
+                printf("Bad /U: %s\n", arg); return 1;
+            }
+            do_fossil_deinit(comn - 1);
             did_something = 1;
             continue;
         }

@@ -65,7 +65,7 @@ VMODEM_OBJS = vmodem.obj int14.obj int8.obj poll.obj telnet.obj ringbuf.obj atcm
 # Default target
 # -------------------------------------------------------------------------
 
-all : vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe .symbolic
+all : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe .symbolic
     @echo Build complete.
 
 # -------------------------------------------------------------------------
@@ -135,10 +135,6 @@ int8.obj    : int8.c    vmodem.h vmodem.cfg
 vmodctl.obj : vmodctl.c
     wpp vmodctl -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
 
-# vmodtest: standalone DOS test utility (INT 14h / INT 2Fh only, no mTCP)
-vmodtest.obj : vmodtest.c
-    wpp vmodtest -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
-
 # comdiag: standalone COM port diagnostic utility (no mTCP)
 comdiag.obj : comdiag.c
     wpp comdiag -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
@@ -146,6 +142,10 @@ comdiag.obj : comdiag.c
 # fosschk: FOSSIL driver detection checker (no mTCP)
 fosschk.obj : fosschk.c
     wpp fosschk -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
+
+# comtest: DOS test helper for automated testing (no mTCP)
+comtest.obj : ../tests/comtest.c
+    wpp ../tests/comtest -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
 
 # -------------------------------------------------------------------------
 # Link VMODEM.EXE
@@ -175,14 +175,6 @@ vmodctl.exe : vmodctl.obj
         name $@ &
         file vmodctl.obj
 
-vmodtest.exe : vmodtest.obj
-    wlink &
-        system dos &
-        option map &
-        option eliminate &
-        name $@ &
-        file vmodtest.obj
-
 comdiag.exe : comdiag.obj
     wlink &
         system dos &
@@ -199,18 +191,26 @@ fosschk.exe : fosschk.obj
         name $@ &
         file fosschk.obj
 
+comtest.exe : comtest.obj
+    wlink &
+        system dos &
+        option map &
+        option eliminate &
+        name $@ &
+        file comtest.obj
+
 # -------------------------------------------------------------------------
 # Clean
 # -------------------------------------------------------------------------
 
-install : vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe .symbolic
+install : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe .symbolic
     @cp vmodem.exe ../../dosenv/vmodem/VMODEM.EXE
     @cp vmodctl.exe ../../dosenv/vmodem/VMODCTL.EXE
-    @cp vmodtest.exe ../../dosenv/vmodem/VMODTEST.EXE
     @cp comdiag.exe ../../dosenv/vmodem/COMDIAG.EXE
     @cp fosschk.exe ../../dosenv/vmodem/FOSSCHK.EXE
+    @cp comtest.exe ../../dosenv/vmodem/COMTEST.EXE
     @echo Installed to ../../dosenv/vmodem/
 
 clean : .symbolic
-    @rm -f *.obj *.o *.map *.err vmodem.exe vmodctl.exe vmodtest.exe comdiag.exe fosschk.exe
+    @rm -f *.obj *.o *.map *.err vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe
     @echo Clean done.

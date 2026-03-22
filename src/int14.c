@@ -476,16 +476,24 @@ void __interrupt __far int14_real_handler(void)
             }
             if (p->mode != PORT_CONN)
                 p->mode = PORT_LISTEN;
-        } else if (p->localPort != 0 && p->listenSock == NULL && p->mode != PORT_CONN) {
-            /* Per-port listen (standalone) */
-            TcpSocket *ls = TcpSocketMgr::getSocket();
-            if (ls && ls->listen(p->localPort, 2048) == 0) {
-                p->listenSock = ls;
-                p->mode = PORT_LISTEN;
-                dbg("[LISTEN-START]");
+        } else if (p->localPort != 0 && p->mode != PORT_CONN) {
+            if (p->listenSock == NULL) {
+                /* Per-port listen (standalone) — first init */
+                TcpSocket *ls = TcpSocketMgr::getSocket();
+                if (ls && ls->listen(p->localPort, 2048) == 0) {
+                    p->listenSock = ls;
+                    p->mode = PORT_LISTEN;
+                    dbg("[LISTEN-START]");
+                } else {
+                    if (ls) TcpSocketMgr::freeSocket(ls);
+                    dbg("[LISTEN-FAIL]");
+                }
             } else {
-                if (ls) TcpSocketMgr::freeSocket(ls);
-                dbg("[LISTEN-FAIL]");
+                /* Listen socket still exists from previous session.
+                 * BBS restarted (RA batch loop) — just re-enter
+                 * PORT_LISTEN so we can accept new connections. */
+                p->mode = PORT_LISTEN;
+                dbg("[LISTEN-RESUME]");
             }
         }
 

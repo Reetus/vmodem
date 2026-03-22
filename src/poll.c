@@ -115,6 +115,8 @@ void do_mtcp_poll(void)
             PortState *tp = &g_state.ports[target];
             tp->sock = ns;
             tp->mode = PORT_CONN;
+            tp->remotePort = ns->dstPort;
+            memcpy(tp->remoteIP, ns->dstHost, 4);
             tp->conn_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
             tp->last_rx_tick = tp->conn_tick;
             tp->last_tx_tick = tp->conn_tick;
@@ -183,6 +185,8 @@ void do_mtcp_poll(void)
             } else if (p->sock->isClosed()) {
                 TcpSocketMgr::freeSocket(p->sock);
                 p->sock = NULL;
+                memset(p->remoteIP, 0, 4);
+                p->remotePort = 0;
                 p->mode = PORT_DISC;
             }
             break;
@@ -201,6 +205,8 @@ void do_mtcp_poll(void)
                 }
                 p->sock = ns;
                 p->mode = PORT_CONN;
+                p->remotePort = ns->dstPort;
+                memcpy(p->remoteIP, ns->dstHost, 4);
                 p->conn_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
                 p->last_rx_tick = p->conn_tick;
                 p->last_tx_tick = p->conn_tick;
@@ -280,6 +286,8 @@ void do_mtcp_poll(void)
                 Tcp::drivePackets();
                 TcpSocketMgr::freeSocket(p->sock);
                 p->sock = NULL;
+                memset(p->remoteIP, 0, 4);
+                p->remotePort = 0;
                 ring_init(&p->rx);
                 at_send_no_carrier(i);
                 /* Keep the listen socket alive — RA's batch file will
@@ -347,23 +355,40 @@ void do_mtcp_poll(void)
                         Tcp::drivePackets();
                         TcpSocketMgr::freeSocket(p->sock);
                         p->sock = NULL;
+                        memset(p->remoteIP, 0, 4);
+                        p->remotePort = 0;
                         ring_init(&p->rx);
                         at_send_no_carrier(i);
-                        p->mode = PORT_DISC;
+                        if (p->listenSock)
+                            p->mode = PORT_LISTEN;
+                        else if (p->huntGroupIdx >= 0)
+                            p->mode = PORT_LISTEN;
+                        else
+                            p->mode = PORT_DISC;
                         break;
                     }
                 }
 
-                /* Disconnect detection — only from INT 28h context */
-                if (g_dos_safe &&
+                /* Disconnect detection — from INT 28h or INT 14h context */
+                if ((g_dos_safe || g_int14_safe) &&
                     (p->sock->isClosed() ||
                     (age > 91UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
                     p->sock->close();
                     TcpSocketMgr::freeSocket(p->sock);
                     p->sock = NULL;
+                    memset(p->remoteIP, 0, 4);
+                    p->remotePort = 0;
                     ring_init(&p->rx);
                     at_send_no_carrier(i);
-                    p->mode = PORT_DISC;
+                    /* Return to PORT_LISTEN if a listen socket exists
+                     * so the port can accept new connections when the
+                     * BBS restarts (RA batch loop → AH=04h). */
+                    if (p->listenSock)
+                        p->mode = PORT_LISTEN;
+                    else if (p->huntGroupIdx >= 0)
+                        p->mode = PORT_LISTEN;
+                    else
+                        p->mode = PORT_DISC;
                 }
             }
             break;
