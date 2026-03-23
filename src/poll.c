@@ -63,10 +63,10 @@ void do_mtcp_poll(void)
 
     g_state.poll_phase = 1;  /* packet processing */
     /* Step 1: Drive the mTCP network stack.
-     * Process up to 4 packets per poll cycle to catch SLIRP-queued
-     * TCP packets that arrive asynchronously after an ARP keepalive. */
+     * Process up to 8 packets per poll cycle (matches PACKET_BUFFERS).
+     * With real NIC hardware, multiple packets accumulate between polls. */
     {
-        int pkt_loops = 4;
+        int pkt_loops = 8;
         while (pkt_loops-- > 0 && Buffer_first != Buffer_next) {
             g_state.pkt_count++;
             PACKET_PROCESS_SINGLE;
@@ -177,15 +177,10 @@ void do_mtcp_poll(void)
                  * with ATA (or auto-answer via S0 register). */
                 at_send_ring(i);
 
-                /* Re-create listen socket so we can reject new
-                 * connections with a "busy" message during PORT_CONN. */
-                if (p->listenSock == NULL) {
-                    TcpSocket *ls = TcpSocketMgr::getSocket();
-                    if (ls) {
-                        ls->listen(p->localPort, 2048);
-                        p->listenSock = ls;
-                    }
-                }
+                /* The listen socket stays alive (mTCP spawns a new
+                 * socket for each SYN).  During PORT_CONN we check
+                 * for accept() and reject with a busy message. */
+                dbg("[SINGLE-ACCEPT]");
             }
             break;
         }
@@ -208,16 +203,46 @@ void do_mtcp_poll(void)
             /* Reject incoming connections while a call is active.
              * Hunt group members skip this — the hunt group loop
              * dispatches to other free ports or rejects if all busy. */
-            if (p->huntGroupIdx < 0 && p->listenSock) {
-                TcpSocket *ns = TcpSocketMgr::accept();
-                if (ns) {
-                    static unsigned char busy_msg[] =
-                        "\r\nLine is engaged. Please try again later.\r\n";
-                    ns->send(busy_msg, sizeof(busy_msg) - 1);
-                    Tcp::drivePackets();
-                    ns->close();
-                    Tcp::drivePackets();
-                    TcpSocketMgr::freeSocket(ns);
+            if (p->huntGroupIdx < 0) {
+                if (p->listenSock) {
+                    if (p->listenSock->state != 2) {
+                        /* Listen socket is no longer in LISTEN state —
+                         * mTCP consumed it.  Log and skip. */
+                        dbg("[LISTEN-GONE]");
+                    }
+
+                    /* Periodic diagnostic: log socket/packet state every ~5s. */
+                    {
+                        static unsigned long last_diag = 0;
+                        unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                        if (now - last_diag >= 91UL) {
+                            last_diag = now;
+                            dbg("[DIAG:");
+                            dbg_hex("A", (unsigned char)TcpSocketMgr::getActiveSockets());
+                            dbg_hex("P", (unsigned char)TcpSocketMgr::getSocketsPendingAccept());
+                            dbg_hex("L", (unsigned char)p->listenSock->state);
+                            dbg_hex("D", (unsigned char)Packets_dropped);
+                            dbg_hex("F", (unsigned char)Buffer_lowFreeCount);
+                            dbg_hex("R", (unsigned char)(Packets_received & 0xFF));
+                            dbg("]");
+                        }
+                    }
+
+                    if (TcpSocketMgr::getSocketsPendingAccept() > 0) {
+                        TcpSocket *ns = TcpSocketMgr::accept();
+                        if (ns) {
+                            static unsigned char busy_msg[] =
+                                "\r\nLine is engaged. Please try again later.\r\n";
+                            dbg("[BUSY-REJECT]");
+                            ns->send(busy_msg, sizeof(busy_msg) - 1);
+                            Tcp::drivePackets();
+                            ns->close();
+                            Tcp::drivePackets();
+                            TcpSocketMgr::freeSocket(ns);
+                        }
+                    }
+                } else {
+                    dbg("[NO-LISTEN-SOCK]");
                 }
             }
 
