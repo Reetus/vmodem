@@ -38,6 +38,7 @@ VMODEM [options]
   /L:n:port         Listen on COM n for Telnet on TCP port
   /L:n-m:port       Hunt group: share TCP port across COM n through m
   /E                Eager listen (open sockets immediately, don't wait for FOSSIL init)
+  /D:file           Write debug log to file (e.g. /D:VMODEM.LOG)
 ```
 
 **Examples:**
@@ -55,6 +56,9 @@ VMODEM /L:1:23 /E
 
 # Hunt group: COM1-4 share port 2323 (first free port answers)
 VMODEM /L:1-4:2323
+
+# Enable debug logging
+VMODEM /L:1:23 /D:VMODEM.LOG
 
 ```
 

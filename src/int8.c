@@ -176,8 +176,8 @@ void __interrupt __far int28_handler(void)
  *   [bp+20] = CX (port index)
  *   [bp+18] = DX (TCP port)
  *   [bp+16] = BX (status buffer offset for MUX_STATUS)
- *   [bp+10] = SI (hostname offset for MUX_CONNECT)
- *   [bp+4]  = ES (segment for MUX_CONNECT host / MUX_STATUS buffer)
+ *   [bp+10] = SI
+ *   [bp+4]  = ES (segment for MUX_STATUS buffer)
  * --------------------------------------------------------------------- */
 
 void __interrupt __far int2f_handler(void)

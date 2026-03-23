@@ -29,7 +29,7 @@
 #include "vmodem_mux.h"
 
 static const char *mode_names[] = {
-    "DISC", "LISTEN", "CONN", "RESOLVING", "CONNECTING", "???"
+    "DISC", "LISTEN", "CONN", "???"
 };
 
 /* -----------------------------------------------------------------------
@@ -115,7 +115,7 @@ static void show_status(void)
                    sb.ports[i].remotePort,
                    sb.ports[i].rxCount);
         } else {
-            /* DISC/LISTEN/RESOLVING/CONNECTING — no remote endpoint */
+            /* DISC/LISTEN — no remote endpoint */
             printf("COM%d   %-11s %-8u %-20s %u\n",
                    i + 1,
                    mode_names[mode],

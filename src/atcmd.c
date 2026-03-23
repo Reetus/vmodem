@@ -19,7 +19,7 @@
  *   ATV0/ATV1 - verbose/numeric result codes
  *   ATS0=n    - set auto-answer ring count
  *   ATS0?     - query S0 register
- *   ATDThost:port - dial (initiate outbound TCP connect)
+ *   ATD            - dial (accepted, returns OK — no outbound support)
  *   ATX, ATL, ATM, AT&, etc. - accepted silently
  */
 
@@ -208,8 +208,11 @@ void at_check_ring(int port_idx)
     if (now - at->ring_tick < RING_INTERVAL_TICKS)
         return;
 
-    /* Auto-answer: if S0 > 0 and we've sent enough rings */
-    if (at->s0 > 0 && at->rings_sent >= at->s0) {
+    /* Auto-answer: if S0 > 0 and we've sent enough rings.
+     * Only auto-answer if FOSSIL is initialized (a BBS is actually
+     * listening on this port).  Without FOSSIL init, the call will
+     * ring until timeout — the telnet client sees "host didn't answer". */
+    if (at->s0 > 0 && at->rings_sent >= at->s0 && fossil_is_init(port_idx)) {
         at->ringing = 0;
         at->rings_sent = 0;
         at_send_connect(port_idx);
@@ -232,6 +235,8 @@ void at_check_ring(int port_idx)
         ring_init(&p->rx);
         at_no_carrier(port_idx);
         if (p->listenSock)
+            p->mode = PORT_LISTEN;
+        else if (p->huntGroupIdx >= 0)
             p->mode = PORT_LISTEN;
         else
             p->mode = PORT_DISC;
@@ -256,7 +261,7 @@ void at_init(int port_idx)
     memset(at, 0, sizeof(AtState));
     at->echo    = 1;
     at->verbose = 1;
-    at->s0      = 1;   /* auto-answer on first ring */
+    at->s0      = 1;   /* auto-answer on first ring (when FOSSIL is initialized) */
 }
 
 /* -----------------------------------------------------------------------
@@ -303,13 +308,14 @@ static void at_execute(int port_idx)
 
         switch (c & 0xDF) {  /* force uppercase */
 
-        case 'Z':  /* ATZ — reset to defaults */
+        case 'Z':  /* ATZ — reset to factory defaults */
             i++;
             if (i < len && cmd[i] >= '0' && cmd[i] <= '9')
                 i++;  /* skip optional digit */
             at->echo    = 1;
             at->quiet   = 0;
             at->verbose = 1;
+            at->s0      = 0;  /* auto-answer off (factory default) */
             at->cmd_mode = 0;
             at->plus_count = 0;
             if (p->mode == PORT_CONN)
@@ -362,6 +368,8 @@ static void at_execute(int port_idx)
                 p->sock = NULL;
                 ring_init(&p->rx);
                 if (p->listenSock)
+                    p->mode = PORT_LISTEN;
+                else if (p->huntGroupIdx >= 0)
                     p->mode = PORT_LISTEN;
                 else
                     p->mode = PORT_DISC;
@@ -438,9 +446,7 @@ static void at_execute(int port_idx)
                 dial_type = cmd[i];
                 i++;
             }
-            /* The rest of the line is the "number" — could be host:port.
-             * For now we don't implement outbound dialing via AT commands;
-             * use VMODCTL /C instead.  Just respond OK. */
+            /* Outbound dialing not supported — just acknowledge. */
             (void)dial_type;
             at_ok(port_idx);
             return;

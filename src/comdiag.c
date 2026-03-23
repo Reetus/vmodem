@@ -45,8 +45,6 @@ static const char *mode_name(unsigned char m)
     case 0: return "DISC";
     case 1: return "LISTEN";
     case 2: return "CONN";
-    case 3: return "RESOLVING";
-    case 4: return "CONNECTING";
     default: return "?";
     }
 }

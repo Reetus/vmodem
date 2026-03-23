@@ -58,34 +58,6 @@ static void __interrupt __far ctrl_break_handler(void) {}
 static void __interrupt __far ctrl_c_handler(void)     {}
 
 /* -----------------------------------------------------------------------
- * parse_ipaddr — parse dotted-decimal IPv4 string
- * Returns 0 on success, -1 if not a valid IPv4 literal.
- * --------------------------------------------------------------------- */
-
-int parse_ipaddr(const char *str, IpAddr_t ip)
-{
-    int parts = 0;
-    const char *p = str;
-
-    while (parts < 4) {
-        int octet = 0, digits = 0;
-        while (*p >= '0' && *p <= '9') {
-            octet = octet * 10 + (*p - '0');
-            p++;
-            digits++;
-        }
-        if (!digits || octet > 255)
-            return -1;
-        ip[parts++] = (unsigned char)octet;
-        if (parts < 4) {
-            if (*p != '.') return -1;
-            p++;
-        }
-    }
-    return (*p == '\0') ? 0 : -1;
-}
-
-/* -----------------------------------------------------------------------
  * check_installed — probe INT 2Fh for VMODEM
  * Returns far pointer to VModemState, or NULL if not installed.
  * --------------------------------------------------------------------- */
@@ -316,6 +288,7 @@ static int     want_help    = 0;
 static int     eager_listen = 0;
 static int     num_port_args = 0;
 static PortArg port_args[MAX_PORT_ARGS];
+static char    log_file[64] = "";  /* debug log filename, empty = no log */
 
 static void print_help(void)
 {
@@ -325,12 +298,14 @@ static void print_help(void)
         "  /L:n:port         Listen on COM n for Telnet on TCP port\n"
         "  /L:n-m:port       Hunt group: share TCP port across COM n-m\n"
         "  /E                Eager listen (don't wait for FOSSIL init)\n"
+        "  /D:file           Write debug log to file (e.g. /D:VMODEM.LOG)\n"
         "  /U                Unload resident copy\n"
         "  /H or /?          Help\n\n"
         "Examples:\n"
         "  VMODEM /L:1:23              COM1 listens on port 23\n"
         "  VMODEM /L:1:23 /E           Listen immediately, no FOSSIL init needed\n"
         "  VMODEM /L:1-4:2323          Hunt group: COM1-4 share port 2323\n"
+        "  VMODEM /L:1:23 /D:VMODEM.LOG  Enable debug logging to file\n"
         "  VMODEM /U                   Unload\n\n"
         "Requires: MTCP env var and packet driver loaded.\n",
         VMODEM_VER_STR
@@ -350,6 +325,16 @@ static int parse_args(int argc, char *argv[])
         if (c == 'H' || c == '?') { want_help = 1; return 0; }
         if (c == 'U') { want_unload = 1; continue; }
         if (c == 'E') { eager_listen = 1; continue; }
+
+        if (c == 'D' && arg[2] == ':') {
+            /* /D:filename — enable debug log file */
+            strncpy(log_file, arg + 3, sizeof(log_file) - 1);
+            log_file[sizeof(log_file) - 1] = '\0';
+            if (log_file[0] == '\0') {
+                printf("Bad /D: missing filename\n"); return -1;
+            }
+            continue;
+        }
 
         if (c == 'L' && arg[2] == ':') {
             char *p = arg + 3;
@@ -691,18 +676,17 @@ int main(int argc, char *argv[])
         g_indos_ptr = (unsigned char __far *)MK_FP(sr.es, r.x.bx);
     }
 
-    /* Open debug log file — the handle stays valid after TSR.
-     * poll.c flushes new debug content to this handle periodically. */
-    {
+    /* Open debug log file if /D:filename was specified.
+     * The handle stays valid after TSR; poll.c flushes to it periodically. */
+    g_state.dbglog_fd = -1;
+    if (log_file[0] != '\0') {
         int fd = -1;
-        g_state.dbglog_fd = -1;
-        if (_dos_creat("VMODEM.LOG", 0, &fd) == 0) {
+        if (_dos_creat(log_file, 0, &fd) == 0) {
             unsigned written = 0;
             g_state.dbglog_fd = (short)fd;
-            /* Verify the handle works with a test write */
             _dos_write(fd, "=== VMODEM debug log ===\r\n", 25, &written);
             _dos_commit(fd);
-            printf("Debug log: VMODEM.LOG (fd=%d, wrote=%u)\n", fd, written);
+            printf("Debug log: %s (fd=%d, wrote=%u)\n", log_file, fd, written);
         }
     }
     /* Save our PSP segment — needed by poll.c to switch PSP for file I/O.

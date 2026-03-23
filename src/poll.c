@@ -36,8 +36,6 @@ extern unsigned char g_int14_safe;
  * do_mtcp_poll
  *
  * Drives all mTCP layers, then services each port:
- *   - PORT_RESOLVING  → drive DNS, check result, start TCP connect when ready
- *   - PORT_CONNECTING → drive TCP, check if connect complete
  *   - PORT_LISTEN     → check for accepted connections
  *   - PORT_CONN       → drain TCP receive buffer into ring buffer
  *
@@ -129,6 +127,7 @@ void do_mtcp_poll(void)
             /* All ports busy — reject */
             static unsigned char busy_msg[] =
                 "\r\nAll lines are engaged. Please try again later.\r\n";
+            dbg("[HUNT-REJECT]");
             ns->send(busy_msg, sizeof(busy_msg) - 1);
             Tcp::drivePackets();
             ns->close();
@@ -145,51 +144,6 @@ void do_mtcp_poll(void)
             continue;
 
         switch (p->mode) {
-
-        case PORT_RESOLVING:
-        {
-            IpAddr_t resolved;
-            int8_t rc;
-
-            if (Dns::isQueryPending())
-                Dns::drivePendingQuery();
-
-            rc = Dns::resolve(p->hostname, resolved, 0);
-
-            if (rc == 0) {
-                TcpSocket *s = TcpSocketMgr::getSocket();
-                if (s == NULL)
-                    break;
-                s->setRecvBuffer(2048);
-                {
-                    static unsigned short src_port = 1025;
-                    if (src_port < 1025 || src_port > 65000)
-                        src_port = 1025;
-                    s->connectNonBlocking(src_port++, resolved, p->remotePort);
-                }
-                p->sock = s;
-                memcpy(p->remoteIP, resolved, 4);
-                p->mode = PORT_CONNECTING;
-            }
-            break;
-        }
-
-        case PORT_CONNECTING:
-            if (p->sock == NULL) {
-                p->mode = PORT_DISC;
-                break;
-            }
-            if (p->sock->isConnectComplete()) {
-                p->mode = PORT_CONN;
-                telnet_on_connect(i);
-            } else if (p->sock->isClosed()) {
-                TcpSocketMgr::freeSocket(p->sock);
-                p->sock = NULL;
-                memset(p->remoteIP, 0, 4);
-                p->remotePort = 0;
-                p->mode = PORT_DISC;
-            }
-            break;
 
         case PORT_LISTEN:
         {
@@ -240,7 +194,12 @@ void do_mtcp_poll(void)
             int16_t n;
 
             if (p->sock == NULL) {
-                p->mode = PORT_DISC;
+                if (p->listenSock)
+                    p->mode = PORT_LISTEN;
+                else if (p->huntGroupIdx >= 0)
+                    p->mode = PORT_LISTEN;
+                else
+                    p->mode = PORT_DISC;
                 break;
             }
 
@@ -265,9 +224,18 @@ void do_mtcp_poll(void)
              * (e.g. not running), we still need to send RINGs and
              * eventually time out unanswered calls. */
             at_check_ring(i);
-            /* at_check_ring may close the socket on ring timeout */
+            /* at_check_ring may close the socket on ring timeout.
+             * Respect the mode already set by ring timeout handler;
+             * only fall back to PORT_DISC if no listen capability. */
             if (p->sock == NULL) {
-                p->mode = PORT_DISC;
+                if (p->mode != PORT_LISTEN) {
+                    if (p->listenSock)
+                        p->mode = PORT_LISTEN;
+                    else if (p->huntGroupIdx >= 0)
+                        p->mode = PORT_LISTEN;
+                    else
+                        p->mode = PORT_DISC;
+                }
                 break;
             }
 
@@ -335,17 +303,22 @@ void do_mtcp_poll(void)
                  * Start after 2s idle (36 ticks).  Repeat every 55 ticks (~3s).
                  * This probes SLIRP quickly so it notices the dead external
                  * connection and RSTs the internal socket. */
-                if (idle > 36UL && (idle % 55UL) < 2UL) {
-                    static unsigned char nop[2] = { 0xFF, 0xF1 }; /* IAC NOP */
-                    telnet_send_raw(p, nop, 2);
+                if (idle > 36UL) {
+                    unsigned long phase = idle / 55UL;
+                    unsigned long rem   = idle - phase * 55UL;
+                    if (rem < 2UL) {
+                        static unsigned char nop[2] = { 0xFF, 0xF1 }; /* IAC NOP */
+                        telnet_send_raw(p, nop, 2);
+                    }
                 }
 
                 /* Idle timeout: disconnect if no TX or RX for configured period.
-                 * Only from INT 28h (g_dos_safe) — not from AH=03h poll. */
-                if (p->idle_timeout > 0 && g_dos_safe) {
+                 * Safe from INT 28h (g_dos_safe) or INT 14h (g_int14_safe). */
+                if (p->idle_timeout > 0 && (g_dos_safe || g_int14_safe)) {
                     unsigned long tx_idle = now - p->last_tx_tick;
                     unsigned long rx_idle = idle;  /* already computed above */
                     unsigned long timeout_ticks = (unsigned long)p->idle_timeout * 18UL;
+                    /* (IDLE-TICK debug removed — too noisy) */
                     /* Both TX and RX must be idle */
                     if (tx_idle > timeout_ticks && rx_idle > timeout_ticks) {
                         dbg("[IDLE-TIMEOUT]");
@@ -372,7 +345,8 @@ void do_mtcp_poll(void)
                 /* Disconnect detection — from INT 28h or INT 14h context */
                 if ((g_dos_safe || g_int14_safe) &&
                     (p->sock->isClosed() ||
-                    (age > 91UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
+                    (age > 182UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
+                    dbg(p->sock->isClosed() ? "[DISC-CLOSED]" : "[DISC-REMOTE]");
                     p->sock->close();
                     TcpSocketMgr::freeSocket(p->sock);
                     p->sock = NULL;
