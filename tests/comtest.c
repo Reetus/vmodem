@@ -44,11 +44,8 @@
 #define FOSSIL_PURGE_IN  0x0A
 #define FOSSIL_INFO      0x1B
 
-/* MUX defines */
-#define MUX_ID           0xC3
-#define MUX_INSTALL_CHK  0x00
-#define MUX_STATUS       0x04
-#define MUX_DISCONNECT   0x03
+/* MUX defines — use shared header for StatusBlock struct */
+#include "../src/vmodem_mux.h"
 
 /* Status word bits */
 #define STATUS_RDA       0x0100  /* AH bit 0: receive data available */
@@ -82,10 +79,17 @@ static void log_info(const char *msg)
  * By opening+writing+closing a separate file, DOSBox-X flushes to host. */
 static void write_ready_flag(const char *marker)
 {
-    FILE *f = fopen("COMTEST.RDY", "w");
-    if (f) {
-        fprintf(f, "%s\n", marker);
-        fclose(f);
+    /* DOSBox-X directory mounts flush new file creation to the host FS
+     * immediately, but overwriting an existing file's content may not
+     * be visible until DOSBox-X exits.  Delete first so fopen always
+     * creates a fresh file that the host can see. */
+    remove("COMTEST.RDY");
+    {
+        FILE *f = fopen("COMTEST.RDY", "w");
+        if (f) {
+            fprintf(f, "%s\n", marker);
+            fclose(f);
+        }
     }
 }
 
@@ -254,11 +258,15 @@ static void test_echo(void)
     }
     log_result("ECHO_DCD", 1, "(connection detected)");
 
-    /* Read data for up to 10 seconds */
+    /* Read data for up to 10 seconds — check DCD to avoid AT echo storm */
     log_info("ECHO: reading data...");
     deadline = get_tick() + 10UL * 18UL;
     while (get_tick() < deadline) {
-        int ch = fossil_rx(0);
+        unsigned short st;
+        int ch;
+        st = fossil_status(0);
+        if (!(st & STATUS_DCD)) break;
+        ch = fossil_rx(0);
         if (ch >= 0) {
             if (buf_len < 127) {
                 buf[buf_len++] = (char)ch;
@@ -315,7 +323,11 @@ static void test_full_cycle(void)
     /* Step 4: Wait for response */
     deadline = get_tick() + 10UL * 18UL;
     while (get_tick() < deadline) {
-        int ch = fossil_rx(0);
+        unsigned short st;
+        int ch;
+        st = fossil_status(0);
+        if (!(st & STATUS_DCD)) break;
+        ch = fossil_rx(0);
         if (ch >= 0) {
             if (buf_len < 127) buf[buf_len++] = (char)ch;
             deadline = get_tick() + 3UL * 18UL;
@@ -426,31 +438,39 @@ static void test_hunt_group(void)
 
     /* Step 6: Echo data on both ports.
      * Read from each port and echo back.  Collect received data
-     * to verify port isolation (each port gets different data). */
+     * to verify port isolation (each port gets different data).
+     * Check DCD on both ports to avoid AT echo storm on disconnect. */
     log_info("HUNT: echoing data on both ports...");
     deadline = get_tick() + 10UL * 18UL;
     while (get_tick() < deadline) {
+        unsigned short st0, st1;
         int ch;
 
+        st0 = fossil_status(0);
+        st1 = fossil_status(1);
+        if (!(st0 & STATUS_DCD) && !(st1 & STATUS_DCD)) break;
+
         /* Echo on COM1 */
-        ch = fossil_rx(0);
-        if (ch >= 0) {
-            if (len1 < 63) buf1[len1++] = (char)ch;
-            fossil_tx(0, (unsigned char)ch);
-            got1 = 1;
-            deadline = get_tick() + 3UL * 18UL;
+        if (st0 & STATUS_DCD) {
+            ch = fossil_rx(0);
+            if (ch >= 0) {
+                if (len1 < 63) buf1[len1++] = (char)ch;
+                fossil_tx(0, (unsigned char)ch);
+                got1 = 1;
+                deadline = get_tick() + 3UL * 18UL;
+            }
         }
 
         /* Echo on COM2 */
-        ch = fossil_rx(1);
-        if (ch >= 0) {
-            if (len2 < 63) buf2[len2++] = (char)ch;
-            fossil_tx(1, (unsigned char)ch);
-            got2 = 1;
-            deadline = get_tick() + 3UL * 18UL;
+        if (st1 & STATUS_DCD) {
+            ch = fossil_rx(1);
+            if (ch >= 0) {
+                if (len2 < 63) buf2[len2++] = (char)ch;
+                fossil_tx(1, (unsigned char)ch);
+                got2 = 1;
+                deadline = get_tick() + 3UL * 18UL;
+            }
         }
-
-        dos_idle();
     }
     buf1[len1] = '\0';
     buf2[len2] = '\0';
@@ -474,6 +494,475 @@ static void test_hunt_group(void)
     fossil_deinit(1);
 }
 
+/* ---- MUX status helper ---- */
+
+static void mux_get_status(unsigned char *mode_out, unsigned short *remotePort_out,
+                           unsigned char *remoteIP_out)
+{
+    /* Read StatusBlock via INT 2Fh MUX_STATUS — use the shared struct */
+    union REGS r;
+    struct SREGS sr;
+    static StatusBlock sb;
+
+    memset(&sb, 0, sizeof(sb));
+    segread(&sr);
+    sr.es = FP_SEG(&sb);
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_STATUS;
+    r.x.bx = FP_OFF(&sb);
+    int86x(0x2F, &r, &r, &sr);
+
+    if (mode_out) *mode_out = sb.ports[0].mode;
+    if (remotePort_out) *remotePort_out = sb.ports[0].remotePort;
+    if (remoteIP_out) memcpy(remoteIP_out, sb.ports[0].remoteIP, 4);
+}
+
+/* ---- New test implementations ---- */
+
+static void test_idle_timeout(void)
+{
+    /* Init FOSSIL, wait for TCP connection, then do NOTHING.
+     * After the idle timeout (30s), VMODEM should disconnect.
+     * Verify DCD drops and port returns to PORT_LISTEN (mode=1). */
+    unsigned char mode;
+
+    fossil_init(0);
+    log_info("IDLE_TIMEOUT: waiting for connection...");
+    write_ready_flag("IDLE_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("IDLE_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("IDLE_DCD", 1, "(connected)");
+
+    /* Now do nothing — just idle poll for up to 45 seconds.
+     * The 30s idle timeout should fire and disconnect us. */
+    log_info("IDLE_TIMEOUT: idling for 45s, expecting disconnect...");
+    if (wait_for_no_dcd(0, 45)) {
+        log_result("IDLE_DISCONNECT", 1, "(DCD dropped after idle)");
+    } else {
+        log_result("IDLE_DISCONNECT", 0, "(still connected after 45s)");
+        fossil_deinit(0);
+        return;
+    }
+
+    /* Check port mode via MUX_STATUS — should be PORT_LISTEN (1) */
+    mux_get_status(&mode, NULL, NULL);
+    log_result("IDLE_PORT_LISTEN", mode == 1,
+               mode == 1 ? "(port returned to LISTEN)" : "(port NOT in LISTEN)");
+
+    fossil_deinit(0);
+}
+
+static void test_dtr_disconnect(void)
+{
+    /* Init FOSSIL, wait for TCP connection, drop DTR (AH=06h AL=00h).
+     * This triggers pending_close → disconnect.
+     * Verify port returns to PORT_LISTEN. */
+    unsigned char mode;
+
+    fossil_init(0);
+    log_info("DTR_DISC: waiting for connection...");
+    write_ready_flag("DTR_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("DTR_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("DTR_DCD", 1, "(connected)");
+
+    /* Small delay to let connection stabilise */
+    {
+        unsigned long t = get_tick() + 36UL; /* ~2 seconds */
+        while (get_tick() < t) dos_idle();
+    }
+
+    /* Drop DTR (AH=06h AL=00h) — should trigger disconnect */
+    log_info("DTR_DISC: dropping DTR...");
+    fossil_call(0x06, 0, 0);  /* AH=06h, DX=0 (COM1), AL=00h (lower DTR) */
+
+    /* pending_close is processed on next poll cycle (INT 28h).
+     * Poll via AH=03h (status) to drive mTCP polling from INT 14h context. */
+    {
+        unsigned long deadline = get_tick() + 10UL * 18UL; /* 10 seconds */
+        while (get_tick() < deadline) {
+            fossil_status(0);  /* drives poll_on_priv_stack → pending_close */
+            mux_get_status(&mode, NULL, NULL);
+            if (mode == 1) break;  /* PORT_LISTEN */
+            dos_idle();
+        }
+    }
+
+    /* Check port mode — should be PORT_LISTEN (1) since listenSock still exists */
+    mux_get_status(&mode, NULL, NULL);
+    {
+        char mbuf[40];
+        sprintf(mbuf, "(mode=%u, expected 1)", (unsigned)mode);
+        log_result("DTR_PORT_LISTEN", mode == 1, mbuf);
+    }
+    fossil_deinit(0);
+}
+
+static void test_eager_listen(void)
+{
+    /* With /E flag, VMODEM should accept connections WITHOUT FOSSIL init.
+     * We do NOT call fossil_init() — just wait for mode=PORT_CONN.
+     *
+     * p->initialized is set by cmd_listen (/L:1:2323), so AH=03h
+     * still goes through VMODEM's handler and drives mTCP polling. */
+    unsigned char mode;
+    unsigned long deadline;
+
+    log_info("EAGER: NOT calling FOSSIL init, waiting for connection...");
+    write_ready_flag("EAGER_WAITING");
+
+    /* Poll MUX_STATUS for PORT_CONN (mode=2) on COM1.
+     * Also call fossil_status to drive mTCP polling from INT 14h context. */
+    deadline = get_tick() + 120UL * 18UL;
+    while (get_tick() < deadline) {
+        fossil_status(0);  /* drives poll_on_priv_stack if not busy */
+        mux_get_status(&mode, NULL, NULL);
+        if (mode == 2) break;
+        dos_idle();
+    }
+
+    log_result("EAGER_CONN", mode == 2,
+               mode == 2 ? "(connection accepted without FOSSIL init)"
+                         : "(no connection detected)");
+}
+
+static void test_mux_port_status(void)
+{
+    /* Init FOSSIL, wait for TCP connection, then read MUX_STATUS.
+     * Verify mode=CONN (2), remotePort>0, remoteIP!=0.0.0.0. */
+    unsigned char mode, rip[4];
+    unsigned short rport;
+
+    fossil_init(0);
+    log_info("MUX_PORT: waiting for connection...");
+    write_ready_flag("MUX_PORT_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("MUX_PORT_DCD", 0, "(timeout)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("MUX_PORT_DCD", 1, "(connected)");
+
+    /* Small delay for status to populate */
+    {
+        unsigned long t = get_tick() + 18UL;
+        while (get_tick() < t) dos_idle();
+    }
+
+    /* Read MUX_STATUS */
+    mux_get_status(&mode, &rport, rip);
+
+    log_result("MUX_PORT_MODE", mode == 2,
+               mode == 2 ? "(mode=CONN)" : "(mode!=CONN)");
+    log_result("MUX_PORT_RPORT", rport > 0,
+               rport > 0 ? "(remotePort > 0)" : "(remotePort = 0)");
+    {
+        int ip_nonzero = (rip[0] | rip[1] | rip[2] | rip[3]) != 0;
+        char ipbuf[20];
+        sprintf(ipbuf, "(%u.%u.%u.%u)", rip[0], rip[1], rip[2], rip[3]);
+        log_result("MUX_PORT_RIP", ip_nonzero, ipbuf);
+    }
+
+    /* Keep alive briefly so Python can verify, then clean up */
+    {
+        unsigned long t = get_tick() + 36UL;
+        while (get_tick() < t) dos_idle();
+    }
+
+    fossil_deinit(0);
+}
+
+static void test_s0_register(void)
+{
+    /* Test S0 auto-answer register:
+     *   Phase 1: Set S0=0 (no auto-answer), connect, verify no CONNECT after 15s.
+     *   Phase 2: Send ATS0=1 to re-enable, verify CONNECT.
+     *
+     * AT commands are sent via FOSSIL TX (AH=01h) while in command mode
+     * (no active connection). */
+    unsigned short ax;
+
+    ax = fossil_init(0);
+    log_result("S0_INIT", ax == 0x1954, "(FOSSIL init)");
+
+    /* Set S0=0 — disable auto-answer */
+    log_info("S0: setting ATS0=0 (disable auto-answer)...");
+    fossil_tx_string(0, "ATS0=0\r");
+    /* Small delay for command to process */
+    {
+        unsigned long t = get_tick() + 18UL;
+        while (get_tick() < t) dos_idle();
+    }
+
+    /* Signal Python to connect */
+    write_ready_flag("S0_PHASE1_WAITING");
+
+    /* Wait up to 20s — DCD should NOT go high (no auto-answer) */
+    log_info("S0: waiting 20s, should NOT get DCD (S0=0)...");
+    if (wait_for_dcd(0, 20)) {
+        log_result("S0_NO_ANSWER", 0, "(DCD went high — auto-answered despite S0=0!)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("S0_NO_ANSWER", 1, "(no auto-answer with S0=0)");
+
+    /* Now set S0=1 — enable auto-answer */
+    log_info("S0: setting ATS0=1 (enable auto-answer)...");
+    fossil_tx_string(0, "ATS0=1\r");
+
+    /* Signal Python (it's still connected, should now get answered) */
+    write_ready_flag("S0_PHASE2_WAITING");
+
+    /* DCD should go high within ~15s (ring + answer) */
+    if (wait_for_dcd(0, 20)) {
+        log_result("S0_AUTO_ANSWER", 1, "(connected after S0=1)");
+    } else {
+        log_result("S0_AUTO_ANSWER", 0, "(no connection after S0=1)");
+    }
+
+    fossil_deinit(0);
+}
+
+static void test_hunt_full(void)
+{
+    /* Hunt group test: init FOSSIL on COM1 and COM2, fill both,
+     * then the Python side connects a third time and expects rejection.
+     * COMTEST just inits and echoes — Python verifies the 3rd rejection. */
+    unsigned short ax;
+
+    ax = fossil_init(0);
+    log_result("HUNTFULL_INIT_COM1", ax == 0x1954, "(FOSSIL init COM1)");
+    ax = fossil_init(1);
+    log_result("HUNTFULL_INIT_COM2", ax == 0x1954, "(FOSSIL init COM2)");
+
+    log_info("HUNTFULL: waiting for first connection on COM1...");
+    write_ready_flag("HUNTFULL_WAITING_DCD1");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("HUNTFULL_DCD1", 0, "(timeout)");
+        fossil_deinit(0); fossil_deinit(1);
+        return;
+    }
+    log_result("HUNTFULL_DCD1", 1, "(COM1 connected)");
+
+    log_info("HUNTFULL: waiting for second connection on COM2...");
+    write_ready_flag("HUNTFULL_WAITING_DCD2");
+
+    if (!wait_for_dcd(1, 120)) {
+        log_result("HUNTFULL_DCD2", 0, "(timeout)");
+        fossil_deinit(0); fossil_deinit(1);
+        return;
+    }
+    log_result("HUNTFULL_DCD2", 1, "(COM2 connected)");
+
+    /* Signal Python to try a 3rd connection (should be rejected) */
+    write_ready_flag("HUNTFULL_BOTH_BUSY");
+
+    /* Keep connections alive for 15 seconds while Python tests 3rd */
+    {
+        unsigned long deadline = get_tick() + 15UL * 18UL;
+        while (get_tick() < deadline) {
+            fossil_status(0);
+            fossil_status(1);
+            dos_idle();
+        }
+    }
+
+    fossil_deinit(0);
+    fossil_deinit(1);
+}
+
+static void test_reconnect(void)
+{
+    /* Init FOSSIL, wait for connect, exchange data, wait for disconnect,
+     * then wait for a SECOND connection on the same port. */
+    unsigned short ax;
+    unsigned long deadline;
+
+    ax = fossil_init(0);
+    log_result("RECONN_INIT", ax == 0x1954, "(FOSSIL init)");
+
+    /* First connection */
+    log_info("RECONN: waiting for first connection...");
+    write_ready_flag("RECONN_WAITING_DCD1");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("RECONN_DCD1", 0, "(timeout)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("RECONN_DCD1", 1, "(first connection)");
+
+    /* Echo data until DCD drops or idle timeout.
+     * Use fossil_status() instead of dos_idle() — AH=03h drives mTCP
+     * polling AND yields properly under DOSBox-X emulation.
+     * MUST check DCD: when remote disconnects, VMODEM sends "NO CARRIER"
+     * text which comtest would echo back as AT commands, creating an
+     * infinite echo loop that prevents the deadline from expiring. */
+    deadline = get_tick() + 5UL * 18UL;
+    while (get_tick() < deadline) {
+        unsigned short st;
+        int ch;
+        st = fossil_status(0);
+        if (!(st & STATUS_DCD)) break;  /* DCD dropped — stop echoing */
+        ch = fossil_rx(0);
+        if (ch >= 0) {
+            fossil_tx(0, (unsigned char)ch);
+            deadline = get_tick() + 3UL * 18UL;
+        }
+    }
+
+    /* Wait for disconnect — idle timeout is 30s + echo period (~5s) */
+    log_info("RECONN: waiting for first disconnect...");
+    write_ready_flag("RECONN_ECHO_DONE");
+    if (!wait_for_no_dcd(0, 45)) {
+        log_result("RECONN_DISC1", 0, "(still connected)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("RECONN_DISC1", 1, "(first disconnect)");
+
+    /* Signal ready for second connection */
+    write_ready_flag("RECONN_WAITING_DCD2");
+
+    /* Wait for second connection */
+    if (!wait_for_dcd(0, 120)) {
+        log_result("RECONN_DCD2", 0, "(timeout on second connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("RECONN_DCD2", 1, "(second connection)");
+
+    /* Echo data again — check DCD to avoid AT echo storm on disconnect */
+    deadline = get_tick() + 5UL * 18UL;
+    while (get_tick() < deadline) {
+        unsigned short st;
+        int ch;
+        st = fossil_status(0);
+        if (!(st & STATUS_DCD)) break;
+        ch = fossil_rx(0);
+        if (ch >= 0) {
+            fossil_tx(0, (unsigned char)ch);
+            deadline = get_tick() + 3UL * 18UL;
+        }
+    }
+
+    /* Wait for second disconnect */
+    if (wait_for_no_dcd(0, 30)) {
+        log_result("RECONN_DISC2", 1, "(second disconnect)");
+    } else {
+        log_result("RECONN_DISC2", 0, "(still connected)");
+    }
+
+    fossil_deinit(0);
+}
+
+static void test_hunt_ring_timeout(void)
+{
+    /* Hunt mode with /E: connect 2 clients, let ring timeout fire
+     * (host doesn't answer — no FOSSIL init).  After timeout, both
+     * ports should return to PORT_LISTEN so new connections are accepted.
+     * Verifies the ring timeout handler correctly handles hunt group ports. */
+    unsigned char mode;
+    unsigned long deadline;
+
+    log_info("HUNT_RT: NOT calling FOSSIL init, waiting for connections...");
+    write_ready_flag("HUNT_RT_WAITING");
+
+    /* Wait for COM1 to accept first connection (mode=2) */
+    deadline = get_tick() + 120UL * 18UL;
+    while (get_tick() < deadline) {
+        fossil_status(0);  /* drive mTCP polling */
+        mux_get_status(&mode, NULL, NULL);
+        if (mode == 2) break;
+        dos_idle();
+    }
+    log_result("HUNT_RT_CONN1", mode == 2, "(first connection on COM1)");
+
+    if (mode != 2) return;
+
+    /* Signal Python to connect second client */
+    write_ready_flag("HUNT_RT_CONN1_OK");
+
+    /* Wait for COM2 to accept second connection */
+    {
+        unsigned char mode2;
+        StatusBlock sb;
+        union REGS r;
+        struct SREGS sr;
+
+        deadline = get_tick() + 120UL * 18UL;
+        while (get_tick() < deadline) {
+            fossil_status(0);
+            memset(&sb, 0, sizeof(sb));
+            segread(&sr);
+            sr.es = FP_SEG(&sb);
+            r.h.ah = MUX_ID;
+            r.h.al = MUX_STATUS;
+            r.x.bx = FP_OFF(&sb);
+            int86x(0x2F, &r, &r, &sr);
+            mode2 = sb.ports[1].mode;
+            if (mode2 == 2) break;
+            dos_idle();
+        }
+        log_result("HUNT_RT_CONN2", mode2 == 2, "(second connection on COM2)");
+        if (mode2 != 2) return;
+    }
+
+    /* Now wait for ring timeout (~60 seconds: 10 rings * 6s interval).
+     * Neither port has FOSSIL init, so no one answers.
+     * After timeout, both ports should return to PORT_LISTEN. */
+    log_info("HUNT_RT: waiting for ring timeout (up to 90s)...");
+    {
+        StatusBlock sb;
+        union REGS r;
+        struct SREGS sr;
+        unsigned char m1, m2;
+
+        deadline = get_tick() + 90UL * 18UL;
+        while (get_tick() < deadline) {
+            fossil_status(0);
+            memset(&sb, 0, sizeof(sb));
+            segread(&sr);
+            sr.es = FP_SEG(&sb);
+            r.h.ah = MUX_ID;
+            r.h.al = MUX_STATUS;
+            r.x.bx = FP_OFF(&sb);
+            int86x(0x2F, &r, &r, &sr);
+            m1 = sb.ports[0].mode;
+            m2 = sb.ports[1].mode;
+            /* Both ports should return to LISTEN after ring timeout */
+            if (m1 == 1 && m2 == 1) break;
+            dos_idle();
+        }
+
+        {
+            char mbuf[60];
+            sprintf(mbuf, "(COM1 mode=%u, COM2 mode=%u, expected both=1)",
+                    (unsigned)m1, (unsigned)m2);
+            log_result("HUNT_RT_RELISTEN", m1 == 1 && m2 == 1, mbuf);
+        }
+    }
+
+    /* Signal Python that ring timeout test is complete */
+    write_ready_flag("HUNT_RT_DONE");
+
+    /* Wait briefly then verify ports can accept NEW connections */
+    {
+        unsigned long t = get_tick() + 36UL;
+        while (get_tick() < t) { fossil_status(0); dos_idle(); }
+    }
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char *argv[])
@@ -484,6 +973,9 @@ int main(int argc, char *argv[])
         printf("Usage: COMTEST <test_name> [args...]\n");
         printf("Tests: FOSSIL_INIT FOSSIL_STATUS MUX_STATUS ECHO\n");
         printf("       FULL_CYCLE SEND_TEXT HUNT_GROUP\n");
+        printf("       IDLE_TIMEOUT DTR_DISCONNECT EAGER_LISTEN\n");
+        printf("       MUX_PORT_STATUS S0_REGISTER HUNT_FULL RECONNECT\n");
+        printf("       HUNT_RING_TIMEOUT\n");
         return 1;
     }
 
@@ -521,6 +1013,22 @@ int main(int argc, char *argv[])
             test_send_text(argc > 2 ? argv[2] : "TEST_DATA");
         else if (strcmp(upper, "HUNT_GROUP") == 0)
             test_hunt_group();
+        else if (strcmp(upper, "IDLE_TIMEOUT") == 0)
+            test_idle_timeout();
+        else if (strcmp(upper, "DTR_DISCONNECT") == 0)
+            test_dtr_disconnect();
+        else if (strcmp(upper, "EAGER_LISTEN") == 0)
+            test_eager_listen();
+        else if (strcmp(upper, "MUX_PORT_STATUS") == 0)
+            test_mux_port_status();
+        else if (strcmp(upper, "S0_REGISTER") == 0)
+            test_s0_register();
+        else if (strcmp(upper, "HUNT_FULL") == 0)
+            test_hunt_full();
+        else if (strcmp(upper, "RECONNECT") == 0)
+            test_reconnect();
+        else if (strcmp(upper, "HUNT_RING_TIMEOUT") == 0)
+            test_hunt_ring_timeout();
         else {
             printf("Unknown test: %s\n", upper);
             fprintf(logfile, "FAIL: UNKNOWN_TEST %s\n", upper);

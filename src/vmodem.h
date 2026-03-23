@@ -51,7 +51,7 @@
 #define TELOPT_SGA       0x03   /* Suppress Go Ahead */
 
 /* Private stack for INT 8h/28h handlers.  mTCP's TCP/ARP/packet processing
- * chain can easily consume 2-3 KB; 4 KB gives adequate headroom. */
+ * chain can easily consume 2-3 KB; 16 KB gives adequate headroom. */
 #define PRIV_STACK_SIZE  16384
 
 /* -----------------------------------------------------------------------
@@ -61,9 +61,7 @@
 typedef enum {
     PORT_DISC       = 0,    /* disconnected, not listening */
     PORT_LISTEN     = 1,    /* listening for incoming TCP connections */
-    PORT_CONN       = 2,    /* actively connected to a remote host */
-    PORT_RESOLVING  = 3,    /* DNS query in flight (async connect pending) */
-    PORT_CONNECTING = 4     /* TCP connect in progress (non-blocking) */
+    PORT_CONN       = 2     /* actively connected to a remote host */
 } PortMode;
 
 /* -----------------------------------------------------------------------
@@ -96,9 +94,6 @@ typedef struct {
     IpAddr_t       remoteIP;
     unsigned short remotePort;
     unsigned short localPort;
-
-    /* Async connect: hostname stored here during PORT_RESOLVING/PORT_CONNECTING */
-    char           hostname[64];
 
     /* Flags */
     unsigned char  initialized; /* 1 = this port is managed by VMODEM */
@@ -198,9 +193,6 @@ extern void (__interrupt __far *old_int2f)(void);
 void dbg(const char *msg);
 void dbg_hex(const char *prefix, unsigned char val);
 
-/* vmodem.c - IP parsing helper */
-int parse_ipaddr(const char *str, IpAddr_t ip);  /* 0=ok, -1=not an IP */
-
 /* ringbuf.c */
 void ring_init(RingBuf *r);
 int  ring_put(RingBuf *r, unsigned char b);   /* 0=ok, -1=full */
@@ -218,6 +210,7 @@ void telnet_send_text(int port_idx, const char *msg);
 extern "C" {
     void __interrupt __far int14_real_handler(void);  /* FOSSIL INT 14h handler */
 }
+int fossil_is_init(int port_idx); /* 1 if AH=04h was called, 0 after AH=05h */
 int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
 
 /* int8.c */

@@ -161,9 +161,10 @@ static unsigned short fossil_status(int port_idx)
      * RI is set during ringing only. */
 
     /* Detect BBS waiting for DCD drop (e.g. RA "Terminating Call").
-     * RA polls AH=03h in a tight loop waiting for DCD=0 but never
-     * sends ATH or drops DTR.  After ~500 consecutive status polls
-     * with no TX/RX activity (~1 second), close the connection. */
+     * RA calls AH=09h (purge) then polls AH=03h waiting for DCD=0
+     * but never sends ATH or drops DTR.  After 3 consecutive status
+     * polls post-purge, report DCD=0; the actual TCP close is handled
+     * by the idle timeout in the INT 28h poll cycle. */
 
     /* CTS + DSR always on (null-modem), plus their delta bits */
     msr |= 0x31;  /* bit 0 DCTS + bit 4 CTS + bit 5 DSR */
@@ -193,6 +194,12 @@ static unsigned short fossil_status(int port_idx)
  * Called from the poll loop and from AH=08h flush.
  * Returns number of bytes sent, or 0 if nothing to do.
  * --------------------------------------------------------------------- */
+
+int fossil_is_init(int port_idx)
+{
+    if (port_idx < 0 || port_idx >= MAX_PORTS) return 0;
+    return g_fossil_init[port_idx];
+}
 
 int fossil_flush_tx(int port_idx)
 {
@@ -302,7 +309,7 @@ void __interrupt __far int14_real_handler(void)
     /* Log FOSSIL function calls (compact: "F:XX ").
      * Suppress AH=03h (status check) — called thousands of times/sec,
      * floods the 2KB circular log and hides all other events. */
-    if (func != 0x03) {
+    if (func != 0x01 && func != 0x02 && func != 0x03) {
         static const char fhx[] = "0123456789ABCDEF";
         static char fb[6] = { 'F', ':', '0', '0', ' ', '\0' };
         fb[2] = fhx[(func >> 4) & 0x0F];
