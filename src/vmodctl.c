@@ -1,0 +1,361 @@
+/*
+ * vmodctl.c - VMODEM Control Utility (VMODCTL.EXE)
+ *
+ * A lightweight companion to VMODEM.EXE that communicates with the
+ * resident TSR via INT 2Fh (Multiplex Interrupt) to:
+ *   - Add or change listen settings without unloading the TSR
+ *   - Initialize/deinitialize FOSSIL on COM ports
+ *   - Disconnect individual COM ports
+ *   - Show current status
+ *
+ * This utility does NOT link against mTCP — it only uses standard
+ * DOS interrupt calls.  Compiled as a small model EXE.
+ *
+ * Usage:
+ *   VMODCTL /I:n                 FOSSIL init COM n
+ *   VMODCTL /U:n                 FOSSIL deinit COM n
+ *   VMODCTL /L:n:port            Set COM n to listen on TCP port
+ *   VMODCTL /D:n                 Disconnect COM n
+ *   VMODCTL /S                   Show status
+ *   VMODCTL /H                   Help
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dos.h>
+#include <i86.h>
+
+#include "vmodem_mux.h"
+
+static const char *mode_names[] = {
+    "DISC", "LISTEN", "CONN", "???"
+};
+
+/* -----------------------------------------------------------------------
+ * check_installed
+ *
+ * Returns a far pointer to the resident VModemState if VMODEM is loaded,
+ * otherwise NULL.  We do NOT dereference the pointer here — it's just
+ * used to confirm presence and to pass ES:BX back for the STATUS call.
+ * --------------------------------------------------------------------- */
+
+static int check_installed(unsigned short *seg_out, unsigned short *off_out)
+{
+    union REGS  r;
+    struct SREGS sr;
+
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_INSTALL_CHK;
+    int86x(0x2F, &r, &r, &sr);
+
+    if (r.h.al != 0xFF)
+        return 0;
+
+    if (seg_out) *seg_out = sr.es;
+    if (off_out) *off_out = (unsigned short)r.x.bx;
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * show_status — display status from the StatusBlock
+ * --------------------------------------------------------------------- */
+
+static void show_status(void)
+{
+    unsigned short seg, off;
+    StatusBlock sb;
+    union REGS  r;
+    struct SREGS sr;
+    int i;
+
+    if (!check_installed(&seg, &off)) {
+        printf("VMODEM is not installed.\n");
+        return;
+    }
+
+    memset(&sb, 0, sizeof(sb));
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+
+    r.h.ah  = MUX_ID;
+    r.h.al  = MUX_STATUS;
+    sr.es   = FP_SEG(&sb);
+    r.x.bx  = FP_OFF(&sb);
+    int86x(0x2F, &r, &r, &sr);
+
+    if (sb.magic != STATUS_BLOCK_MAGIC) {
+        printf("VMODEM: bad status block magic.\n");
+        return;
+    }
+
+    printf("\nVMODEM Status\n");
+    printf("%-6s %-11s %-8s %-20s %s\n",
+           "Port", "Mode", "LocalTCP", "RemoteIP:Port", "RxBuf");
+    printf("------------------------------------------------------------\n");
+
+    for (i = 0; i < MAX_PORTS; i++) {
+        unsigned char mode = sb.ports[i].mode;
+        if (!sb.ports[i].initialized) {
+            printf("COM%d   not managed\n", i + 1);
+            continue;
+        }
+        if (mode > 4) mode = 5;
+        if (mode == 2) {
+            /* PORT_CONN — show remote IP:port */
+            printf("COM%d   %-11s %-8u %u.%u.%u.%u:%-5u  %u\n",
+                   i + 1,
+                   mode_names[mode],
+                   sb.ports[i].localPort,
+                   sb.ports[i].remoteIP[0], sb.ports[i].remoteIP[1],
+                   sb.ports[i].remoteIP[2], sb.ports[i].remoteIP[3],
+                   sb.ports[i].remotePort,
+                   sb.ports[i].rxCount);
+        } else {
+            /* DISC/LISTEN — no remote endpoint */
+            printf("COM%d   %-11s %-8u %-20s %u\n",
+                   i + 1,
+                   mode_names[mode],
+                   sb.ports[i].localPort,
+                   "-",
+                   sb.ports[i].rxCount);
+        }
+    }
+    printf("\n");
+}
+
+/* -----------------------------------------------------------------------
+ * do_listen — send MUX_LISTEN to the TSR
+ * --------------------------------------------------------------------- */
+
+static void do_listen(int com_idx, unsigned short tcp_port)
+{
+    union REGS  r;
+    struct SREGS sr;
+
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_LISTEN;
+    r.x.cx = (unsigned short)com_idx;
+    r.x.dx = tcp_port;
+    int86x(0x2F, &r, &r, &sr);
+
+    printf("COM%d: listening on TCP port %u\n", com_idx + 1, tcp_port);
+}
+
+/* -----------------------------------------------------------------------
+ * do_fossil_init — call INT 14h AH=04h (FOSSIL init) on a COM port
+ *
+ * This triggers VMODEM to create the listen socket for the port,
+ * which is normally deferred until a BBS calls FOSSIL init.
+ * --------------------------------------------------------------------- */
+
+static void do_fossil_init(int com_idx)
+{
+    union REGS r;
+
+    memset(&r, 0, sizeof(r));
+    r.h.ah = 0x04;      /* FOSSIL init */
+    r.x.dx = (unsigned short)com_idx;
+    int86(0x14, &r, &r);
+
+    if (r.x.ax == 0x1954) {
+        printf("COM%d: FOSSIL initialized (signature 0x1954).\n",
+               com_idx + 1);
+    } else {
+        printf("COM%d: FOSSIL init failed (AX=0x%04X).\n",
+               com_idx + 1, r.x.ax);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * do_fossil_deinit — call INT 14h AH=05h (FOSSIL deinit) on a COM port
+ * --------------------------------------------------------------------- */
+
+static void do_fossil_deinit(int com_idx)
+{
+    union REGS r;
+
+    memset(&r, 0, sizeof(r));
+    r.h.ah = 0x05;      /* FOSSIL deinit */
+    r.x.dx = (unsigned short)com_idx;
+    int86(0x14, &r, &r);
+
+    printf("COM%d: FOSSIL deinitialized.\n", com_idx + 1);
+}
+
+/* -----------------------------------------------------------------------
+ * do_disconnect — send MUX_DISCONNECT to the TSR
+ * --------------------------------------------------------------------- */
+
+static void do_disconnect(int com_idx)
+{
+    union REGS  r;
+    struct SREGS sr;
+
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_DISCONNECT;
+    r.x.cx = (unsigned short)com_idx;
+    int86x(0x2F, &r, &r, &sr);
+
+    printf("COM%d: disconnected.\n", com_idx + 1);
+}
+
+/* -----------------------------------------------------------------------
+ * print_help
+ * --------------------------------------------------------------------- */
+
+static void print_help(void)
+{
+    printf(
+        "VMODCTL - Control utility for the VMODEM TSR\n"
+        "\n"
+        "Usage: VMODCTL [options]\n"
+        "\n"
+        "  /I:n              FOSSIL init COM n (activates listen socket)\n"
+        "  /U:n              FOSSIL deinit COM n\n"
+        "  /L:n:port         Set COM n to listen on TCP port\n"
+        "  /D:n              Disconnect COM n\n"
+        "  /S                Show status of all ports\n"
+        "  /G                Dump debug log\n"
+        "  /H or /?          This help\n"
+        "\n"
+        "Examples:\n"
+        "  VMODCTL /I:1 /S        Init COM1 FOSSIL then show status\n"
+        "  VMODCTL /L:1:23        COM1 listens on Telnet port 23\n"
+        "  VMODCTL /D:1           Disconnect COM1\n"
+        "  VMODCTL /S             Show status\n"
+    );
+}
+
+/* -----------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------- */
+
+int main(int argc, char *argv[])
+{
+    int i;
+    int did_something = 0;
+
+    if (argc < 2) {
+        print_help();
+        return 0;
+    }
+
+    for (i = 1; i < argc; i++) {
+        char *arg = argv[i];
+        char  c;
+        unsigned short seg, off;
+
+        if (arg[0] != '/' && arg[0] != '-') continue;
+
+        c = arg[1];
+        if (c >= 'a' && c <= 'z') c -= 32;
+
+        if (c == 'H' || c == '?') { print_help(); return 0; }
+
+        if (c == 'S') {
+            show_status();
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'I' && arg[2] == ':') {
+            /* /I:n — FOSSIL init (INT 14h AH=04h) */
+            int comn = arg[3] - '0';
+            if (comn < 1 || comn > 4) {
+                printf("Bad /I: %s\n", arg); return 1;
+            }
+            do_fossil_init(comn - 1);
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'U' && arg[2] == ':') {
+            /* /U:n — FOSSIL deinit (INT 14h AH=05h) */
+            int comn = arg[3] - '0';
+            if (comn < 1 || comn > 4) {
+                printf("Bad /U: %s\n", arg); return 1;
+            }
+            do_fossil_deinit(comn - 1);
+            did_something = 1;
+            continue;
+        }
+
+        /* All other options require VMODEM to be installed */
+        if (!check_installed(&seg, &off)) {
+            printf("VMODEM is not installed.\n");
+            return 1;
+        }
+
+        if (c == 'L' && arg[2] == ':') {
+            /* /L:n:port */
+            char *p = arg + 3;
+            int comn = *p - '0';
+            unsigned short port;
+            if (comn < 1 || comn > 4 || p[1] != ':') {
+                printf("Bad /L: %s\n", arg); return 1;
+            }
+            port = (unsigned short)atoi(p + 2);
+            if (!port) { printf("Bad port: %s\n", arg); return 1; }
+            do_listen(comn - 1, port);
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'D' && arg[2] == ':') {
+            /* /D:n */
+            int comn = arg[3] - '0';
+            if (comn < 1 || comn > 4) {
+                printf("Bad /D: %s\n", arg); return 1;
+            }
+            do_disconnect(comn - 1);
+            did_something = 1;
+            continue;
+        }
+
+        if (c == 'G') {
+            /* /G — dump debug log */
+            union REGS r;
+            struct SREGS sr;
+            static char dbgbuf[2048];
+            unsigned short got;
+
+            segread(&sr);
+            sr.es = FP_SEG(dbgbuf);
+            r.h.ah = MUX_ID;
+            r.h.al = MUX_DEBUGLOG;
+            r.w.bx = FP_OFF(dbgbuf);
+            r.w.cx = sizeof(dbgbuf);
+            int86x(0x2F, &r, &r, &sr);
+            got = r.w.ax;
+            if (got > 0) {
+                unsigned short k;
+                for (k = 0; k < got; k++)
+                    putchar(dbgbuf[k]);
+                putchar('\n');
+            } else {
+                printf("(debug log empty)\n");
+            }
+            did_something = 1;
+            continue;
+        }
+
+        printf("Unknown option: %s  (use /H for help)\n", arg);
+        return 1;
+    }
+
+    if (!did_something) {
+        show_status();
+    }
+
+    return 0;
+}
