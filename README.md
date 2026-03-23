@@ -1,6 +1,6 @@
 # VMODEM
 
-A DOS TSR (Terminate and Stay Resident) virtual serial port driver that bridges FOSSIL INT 14h to TCP/IP via the [mTCP](http://www.brutman.com/mTCP/) stack. It lets legacy DOS BBS software accept and make telnet connections over a real network — no physical modem required.
+A DOS TSR (Terminate and Stay Resident) virtual serial port driver that bridges FOSSIL INT 14h to TCP/IP via the [mTCP](http://www.brutman.com/mTCP/) stack. It lets legacy DOS BBS software accept telnet connections over a real network — no physical modem required. Also provides a BSD socket library (`vsocket.lib`) so DOS programs can make outgoing TCP connections through the TSR.
 
 Yes, we're writing DOS TSR drivers in 2026. The mass psychosis is real, but at least our BBS still answers the phone.
 
@@ -15,6 +15,8 @@ VMODEM hooks INT 14h to present a standard FOSSIL driver interface (the same API
 - **Hunt groups** — multiple COM ports share a single TCP listen port; incoming connections are dispatched to the first free port (like a modem hunt group)
 - **Telnet IAC** — handles telnet protocol negotiation (WILL/WONT/DO/DONT, IAC escaping, NOP keepalives)
 - **AT command emulation** — RING, auto-answer (S0 register), CONNECT/NO CARRIER responses
+- **Door support** — AT&D0 ignores DTR drops so BBS door programs can launch without losing the connection
+- **Outgoing TCP** — BSD socket API (`vsocket.lib`) lets DOS programs make outgoing TCP connections through the TSR
 - **Idle timeout** — automatically disconnects stale sessions
 - **Stays resident** — installs as a TSR, controlled at runtime via `VMODCTL.EXE`
 
@@ -169,7 +171,7 @@ The build system is designed to run on Linux targeting DOS:
 ```bash
 cd tests/
 
-# Run all 7 tests
+# Run all tests
 python3 test_vmodem.py
 
 # Run a specific test
@@ -193,6 +195,16 @@ python3 test_vmodem.py -l
 | `test_full_cycle` | Full lifecycle: connect, exchange greeting, disconnect |
 | `test_send_text` | DOS sends text via FOSSIL TX, Python receives it |
 | `test_hunt_group` | Two connections dispatched to COM1 and COM2 via shared port |
+| `test_idle_timeout` | Idle timeout disconnects and port returns to LISTEN |
+| `test_dtr_disconnect` | FOSSIL deinit triggers disconnect, port returns to LISTEN |
+| `test_eager_listen` | /E flag: connections accepted without FOSSIL init |
+| `test_mux_port_status` | MUX_STATUS shows CONN mode and correct remote IP:port |
+| `test_s0_register` | S0 auto-answer register: S0=0 prevents answer, S0=1 enables |
+| `test_hunt_full` | Hunt group rejects 3rd connection when all ports busy |
+| `test_reconnect` | Connect, disconnect, connect again on same port |
+| `test_hunt_ring_timeout` | Hunt mode /E: ring timeout returns ports to LISTEN |
+| `test_tcp_out` | Outgoing TCP connection via MUX socket API |
+| `test_relay` | Bidirectional relay: FOSSIL incoming ↔ MUX socket outgoing |
 
 Tests run inside DOSBox-X with slirp networking. The Python harness launches DOSBox-X, waits for VMODEM to start listening, connects via TCP, and communicates with `COMTEST.EXE` running inside the VM. Results are read from `COMTEST.LOG` written to a shared directory.
 
@@ -241,14 +253,16 @@ VMODEM implements the standard FOSSIL INT 14h functions that BBS software expect
 | 02h | RX char | Read byte from ring buffer |
 | 03h | Status | Return LSR/MSR-style status word |
 | 04h | Init | Initialize port, create listen socket, return 0x1954 |
-| 05h | Deinit | Close connections, release port |
-| 06h | DTR | DTR drop triggers disconnect |
+| 05h | Deinit | Close connections, release port (respects AT&D0) |
+| 06h | DTR | DTR drop triggers disconnect (ignored if AT&D0 set) |
 | 08h | Flush TX | Drain TX ring to TCP socket |
 | 09h | Purge TX | Discard pending TX data |
 | 0Ah | Purge RX | Discard pending RX data |
 | 1Bh | Info | Return driver info block |
 
 ### Multiplex Interface (INT 2Fh, AH=C3h)
+
+Runtime control and external socket API. Subcommands 00h–07h control the TSR; 10h–18h provide the outgoing socket API used by `vsocket.lib`.
 
 | AL | Function | Registers |
 |----|----------|-----------|
@@ -259,6 +273,15 @@ VMODEM implements the standard FOSSIL INT 14h functions that BBS software expect
 | 05h | Poll | Trigger one mTCP poll cycle |
 | 06h | Debug log | ES:BX→buffer, CX=size |
 | 07h | Hunt listen | CL=port mask, DX=TCP port |
+| 10h | Sock alloc | Returns AL=handle (0–3) or 0xFF |
+| 11h | Sock connect | CL=handle, DX=port, ES:BX→4-byte IP |
+| 12h | Sock status | CL=handle; returns AL=state |
+| 13h | Sock send | CL=handle, DX=len, ES:BX→data |
+| 14h | Sock recv | CL=handle, DX=bufsz, ES:BX→buffer |
+| 15h | Sock close | CL=handle |
+| 16h | Sock result | Returns AX=last operation result |
+| 17h | DNS resolve | ES:BX→hostname; initiates async DNS query |
+| 18h | DNS result | ES:BX→4-byte IP buf; returns AL=state |
 | FFh | Unload | Restore vectors, free TSR memory |
 
 ### Port State Machine
@@ -296,6 +319,41 @@ Tuned for the 64 KB DGROUP constraint:
 - 6 TCP transmit buffers
 - 1 DNS cache entry
 - `TCP_LISTEN_CODE` enabled (required for `TcpSocket::listen()`)
+
+## BSD Socket Library (vsocket.lib)
+
+VMODEM includes a BSD-style socket library that lets DOS programs make outgoing TCP connections through the resident TSR. Link your program against `VSOCKET.LIB` and include `VSOCKET.H`.
+
+```c
+#include "vsocket.h"
+
+int main(void)
+{
+    struct sockaddr_in addr;
+    int s;
+
+    if (vsock_init() != 0) return 1;  /* verify TSR loaded */
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(6667);
+    addr.sin_addr.s_addr = inet_addr("10.0.2.2");
+    connect(s, (struct sockaddr *)&addr, sizeof(addr));
+
+    send(s, "NICK dos\r\n", 10, 0);
+    /* ... */
+    closesocket(s);
+    return 0;
+}
+```
+
+**Limitations:**
+- AF_INET + SOCK_STREAM only (TCP); no UDP
+- Max 4 simultaneous sockets
+- `gethostbyname()` supports DNS resolution and dotted-decimal IPs
+- `connect()` blocks with a 30-second timeout
+
+**This library is published in case it's useful to someone, but is not supported. Use at your own risk.**
 
 ## License
 

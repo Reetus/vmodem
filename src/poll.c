@@ -340,7 +340,6 @@ void do_mtcp_poll(void)
                         dbg("[IDLE-TIMEOUT]");
                         telnet_send_text(i, "\r\nClosing idle connection.\r\n");
                         p->sock->close();
-                        /* Drive packets to push FIN through SLIRP */
                         Tcp::drivePackets();
                         TcpSocketMgr::freeSocket(p->sock);
                         p->sock = NULL;

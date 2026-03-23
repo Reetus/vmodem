@@ -35,6 +35,8 @@
 #include <conio.h>
 #include <string.h>
 #include "vmodem.h"
+#include "tcp.h"
+#include "tcpsockm.h"
 
 /* Saved original INT 14h vector — set during TSR install in vmodem.c */
 void (__interrupt __far *old_int14)(void) = NULL;
@@ -455,15 +457,38 @@ void __interrupt __far int14_real_handler(void)
         ring_init(&p->rx);
         txring_init(&g_tx[port_idx]);
 
-        /* If an old connection is pending close (from DEINIT or DCD-drop),
-         * keep it deferred to the poll cycle (packet driver works better
-         * there), but mark it "silent" so POLL-CLOSE won't inject
-         * NO CARRIER into the RX ring — the BBS is doing a fresh init
-         * and doesn't need to see stale disconnect messages. */
+        /* If an old connection is pending close (from DEINIT, DCD-drop,
+         * or ATZ), close it NOW rather than deferring to the poll cycle.
+         * Deferring caused a race: the BBS re-inits and a new caller
+         * connects before POLL-CLOSE runs, and POLL-CLOSE then kills
+         * the NEW connection instead of the old one.
+         * INT 14h context has interrupts enabled, so the packet driver
+         * IRQ can fire and transmit the FIN. */
         if (p->pending_close || (p->mode == PORT_CONN && p->sock != NULL
             && g_purge_seen[port_idx] >= 3)) {
             dbg("[INIT-DISC]");
-            p->pending_close = 2;  /* 2 = silent close (no NO CARRIER) */
+            p->pending_close = 0;
+            p->dtr_ignore = 0;  /* reset &D0 on disconnect */
+            if (p->sock) {
+                telnet_send_text(port_idx, "\r\nSession finished.\r\n");
+                Tcp::drivePackets();
+                /* Blocking close — completes the full TCP handshake
+                 * so the socket is properly cleaned up for reuse.
+                 * This is fine in INIT context: the BBS just called
+                 * INIT and can tolerate a brief wait.  mTCP has a
+                 * 15-second timeout if the remote is unresponsive. */
+                p->sock->close();
+                TcpSocketMgr::freeSocket(p->sock);
+                p->sock = NULL;
+            }
+            memset(p->remoteIP, 0, 4);
+            p->remotePort = 0;
+            if (p->listenSock)
+                p->mode = PORT_LISTEN;
+            else if (p->huntGroupIdx >= 0)
+                p->mode = PORT_LISTEN;
+            else
+                p->mode = PORT_DISC;
         }
 
         /* Reset state */
@@ -472,6 +497,10 @@ void __interrupt __far int14_real_handler(void)
         g_overrun[port_idx] = 0;
         g_dtr[port_idx] = 1;  /* DTR raised */
         g_purge_seen[port_idx] = 0;
+        /* Only reset &D0 when actually disconnecting (INIT-DISC above).
+         * If returning from a door, the connection is live and dtr_ignore
+         * must stay set — the BBS may drop DTR as part of its post-door
+         * FOSSIL re-init sequence. */
         {
             unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
             p->last_tx_tick = now;
@@ -485,16 +514,12 @@ void __interrupt __far int14_real_handler(void)
             unsigned char was_ringing = at_is_ringing(port_idx);
             at_init(port_idx);
 
-            if (p->pending_close) {
-                /* Socket is being closed but hasn't been freed yet.
-                 * Force command mode so the BBS's AT init commands
-                 * go to the AT parser, not out the dying socket. */
-                at_set_cmd_mode(port_idx);
-            } else if (was_ringing && p->mode == PORT_CONN && p->sock != NULL) {
-                /* Only restore ringing if the call was unanswered (race
-                 * condition: someone connected while BBS was restarting).
-                 * For answered calls (was_ringing=0), leave ringing=0 so
-                 * the BBS stays in data mode. */
+            /* Only restore ringing if the call was unanswered (race
+             * condition: someone connected while BBS was restarting).
+             * For answered calls (was_ringing=0), leave ringing=0 so
+             * the BBS stays in data mode. */
+            if (was_ringing && p->mode == PORT_CONN && p->sock != NULL
+                && !p->pending_close) {
                 at_set_ringing_silent(port_idx);
             }
         }

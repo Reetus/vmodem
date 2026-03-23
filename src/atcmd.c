@@ -360,7 +360,7 @@ static void at_execute(int port_idx)
 
         switch (c & 0xDF) {  /* force uppercase (letters only) */
 
-        case 'Z':  /* ATZ — reset to factory defaults */
+        case 'Z':  /* ATZ — reset to factory defaults + disconnect */
             i++;
             if (i < len && cmd[i] >= '0' && cmd[i] <= '9')
                 i++;  /* skip optional digit */
@@ -368,9 +368,10 @@ static void at_execute(int port_idx)
             at->quiet   = 0;
             at->verbose = 1;
             at->s0      = 0;  /* auto-answer off (factory default) */
-            at->cmd_mode = 0;
+            at->cmd_mode = 1;  /* stay in command mode */
             at->plus_count = 0;
-            if (p->mode == PORT_CONN)
+            p->dtr_ignore = 0;  /* reset &D0 */
+            if (p->mode == PORT_CONN && p->sock != NULL)
                 cmd_disconnect(port_idx);
             at_ok(port_idx);
             return;
