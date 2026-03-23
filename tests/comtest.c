@@ -47,6 +47,9 @@
 /* MUX defines — use shared header for StatusBlock struct */
 #include "../src/vmodem_mux.h"
 
+/* BSD socket API wrapping VMODEM's MUX socket interface */
+#include "lib/vsocket.h"
+
 /* Status word bits */
 #define STATUS_RDA       0x0100  /* AH bit 0: receive data available */
 #define STATUS_THRE      0x2000  /* AH bit 5: TX holding register empty */
@@ -984,133 +987,60 @@ static void test_hunt_ring_timeout(void)
 }
 
 /* -----------------------------------------------------------------------
- * MUX socket helpers — for external TCP via VMODEM's mTCP stack
+ * test_dns_resolve — DNS hostname resolution via gethostbyname()
  *
- * Due to a Watcom compiler issue with [bp+22] in __interrupt handlers
- * that make C++ function calls, we use a two-step protocol:
- * 1. Call the MUX_SOCK_* function (which writes result to g_state)
- * 2. Call MUX_SOCK_RESULT to read it (this case has no function calls)
+ * Usage: COMTEST DNS_RESOLVE [hostname]
+ * Resolves a hostname and logs the IP address.
+ * Default hostname: one.one.one.one (Cloudflare, A records 1.1.1.1, 1.0.0.1)
  * ----------------------------------------------------------------------- */
 
-static unsigned short mux_get_result(void)
+static void test_dns_resolve(const char *hostname)
 {
-    union REGS r;
-    memset(&r, 0, sizeof(r));
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_SOCK_RESULT;
-    int86(0x2F, &r, &r);
-    return r.x.ax;
-}
+    struct hostent *he;
+    unsigned char *ip;
 
-static int mux_sock_alloc(void)
-{
-    union REGS r;
-    unsigned short res;
-    memset(&r, 0, sizeof(r));
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_SOCK_ALLOC;
-    int86(0x2F, &r, &r);
-    res = mux_get_result();
-    return (res == 0xFF) ? -1 : (int)(res & 0xFF);
-}
-
-static int mux_sock_connect(int handle, unsigned char __near *ip, unsigned short port)
-{
-    /* Use inline asm — int86x() with SREGS hangs (see mux_sock_recv). */
-    unsigned short res;
-    unsigned char h = (unsigned char)handle;
-    __asm {
-        push es
-        push ds
-        pop  es          /* ES = DS (DGROUP) — ip is near */
-        mov  ah, MUX_ID
-        mov  al, MUX_SOCK_CONNECT
-        mov  cl, h
-        mov  dx, port
-        mov  bx, ip
-        int  2Fh
-        pop  es
+    if (vsock_init() != 0) {
+        log_result("DNS_INIT", 0, "(VMODEM not loaded)");
+        write_ready_flag("DNS_FAIL");
+        return;
     }
-    res = mux_get_result();
-    return (res == 0) ? 0 : -1;
-}
+    log_result("DNS_INIT", 1, "(VMODEM present)");
 
-static int mux_sock_status(int handle)
-{
-    union REGS r;
-    memset(&r, 0, sizeof(r));
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_SOCK_STATUS;
-    r.h.cl = (unsigned char)handle;
-    int86(0x2F, &r, &r);
-    return (int)(mux_get_result() & 0xFF);
-}
+    log_info("DNS_RESOLVE: resolving...");
 
-static int mux_sock_send(int handle, unsigned char __near *data, unsigned short len)
-{
-    /* Use inline asm — int86x() with SREGS hangs (see mux_sock_recv). */
-    unsigned short result;
-    unsigned char h = (unsigned char)handle;
-    __asm {
-        push es
-        push ds
-        pop  es          /* ES = DS (DGROUP) — data is near */
-        mov  ah, MUX_ID
-        mov  al, MUX_SOCK_SEND
-        mov  cl, h
-        mov  dx, len
-        mov  bx, data
-        int  2Fh
-        pop  es
+    he = gethostbyname(hostname);
+    if (he == (struct hostent *)0) {
+        log_result("DNS_RESOLVE", 0, "(gethostbyname returned NULL)");
+        write_ready_flag("DNS_FAIL");
+        return;
     }
-    result = mux_get_result();
-    return (int)result;
-}
 
-static int mux_sock_recv(int handle, unsigned char __near *buf, unsigned short bufsz)
-{
-    /* Use inline asm to set ES=DS (small model, buffer is in DGROUP)
-     * and call INT 2Fh.  int86x() with SREGS causes a hang — likely
-     * a segment register corruption issue with Watcom's int86x. */
-    unsigned short result;
-    unsigned char h = (unsigned char)handle;
-    __asm {
-        push es
-        push ds
-        pop  es          /* ES = DS (DGROUP) — buffer is near */
-        mov  ah, MUX_ID
-        mov  al, MUX_SOCK_RECV
-        mov  cl, h
-        mov  dx, bufsz
-        mov  bx, buf
-        int  2Fh
-        pop  es
+    if (he->h_length != 4 || he->h_addr_list[0] == (char *)0) {
+        log_result("DNS_RESOLVE", 0, "(bad hostent)");
+        write_ready_flag("DNS_FAIL");
+        return;
     }
-    result = mux_get_result();
-    return (int)result;
-}
 
-static void mux_sock_close(int handle)
-{
-    union REGS r;
-    memset(&r, 0, sizeof(r));
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_SOCK_CLOSE;
-    r.h.cl = (unsigned char)handle;
-    int86(0x2F, &r, &r);
-}
+    ip = (unsigned char *)he->h_addr;
+    {
+        char detail[80];
+        sprintf(detail, "(host=%s ip=%u.%u.%u.%u)",
+                hostname, ip[0], ip[1], ip[2], ip[3]);
+        log_result("DNS_RESOLVE", 1, detail);
+    }
 
-static void mux_poll(void)
-{
-    union REGS r;
-    memset(&r, 0, sizeof(r));
-    r.h.ah = MUX_ID;
-    r.h.al = MUX_POLL;
-    int86(0x2F, &r, &r);
+    /* Verify resolved IP is not 0.0.0.0 */
+    {
+        int nonzero = (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
+        log_result("DNS_NONZERO", nonzero,
+                   nonzero ? "(valid IP)" : "(got 0.0.0.0)");
+    }
+
+    write_ready_flag("DNS_PASS");
 }
 
 /* -----------------------------------------------------------------------
- * test_tcp_out — outgoing TCP connection via MUX socket API
+ * test_tcp_out — outgoing TCP connection via BSD socket API (vsocket.lib)
  *
  * Usage: COMTEST TCP_OUT <ip0> <ip1> <ip2> <ip3> <port>
  * Connects to the given IP:port, sends HELLO_FROM_DOS, receives response.
@@ -1120,62 +1050,53 @@ static void test_tcp_out(unsigned char ip0, unsigned char ip1,
                          unsigned char ip2, unsigned char ip3,
                          unsigned short port)
 {
-    int handle;
-    int st;
-    unsigned long deadline;
-    unsigned char ip[4];
-    static unsigned char sendbuf[32];
+    int sock;
+    int n;
+    struct sockaddr_in addr;
     static unsigned char recvbuf[256];
     int recv_total = 0;
+    unsigned long deadline;
+
+    if (vsock_init() != 0) {
+        log_result("TCPOUT_ALLOC", 0, "(VMODEM not loaded)");
+        return;
+    }
 
     log_info("TCP_OUT: allocating socket...");
-    handle = mux_sock_alloc();
-    log_result("TCPOUT_ALLOC", handle >= 0,
-               handle >= 0 ? "(got handle)" : "(alloc failed)");
-    if (handle < 0) return;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    log_result("TCPOUT_ALLOC", sock >= 0,
+               sock >= 0 ? "(got socket)" : "(alloc failed)");
+    if (sock < 0) return;
 
-    ip[0] = ip0; ip[1] = ip1; ip[2] = ip2; ip[3] = ip3;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    {
+        unsigned char *p = (unsigned char *)&addr.sin_addr.s_addr;
+        p[0] = ip0; p[1] = ip1; p[2] = ip2; p[3] = ip3;
+    }
 
     log_info("TCP_OUT: connecting...");
-    st = mux_sock_connect(handle, ip, port);
-    log_result("TCPOUT_CONNECT", st == 0,
-               st == 0 ? "(initiated)" : "(connect failed)");
-    if (st != 0) { mux_sock_close(handle); return; }
-
-    /* Poll until connected (30 second timeout). */
-    deadline = get_tick() + 546UL;
-    while (get_tick() < deadline) {
-        dos_idle();
-        mux_poll();
-        st = mux_sock_status(handle);
-        if (st == EXT_SOCK_ESTABLISHED) break;
-        if (st == EXT_SOCK_ERROR) break;
-    }
-    log_result("TCPOUT_ESTABLISHED", st == EXT_SOCK_ESTABLISHED,
-               st == EXT_SOCK_ESTABLISHED ? "(connected)" : "(timeout/error)");
-    if (st != EXT_SOCK_ESTABLISHED) { mux_sock_close(handle); return; }
+    n = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    log_result("TCPOUT_ESTABLISHED", n == 0,
+               n == 0 ? "(connected)" : "(timeout/error)");
+    if (n != 0) { closesocket(sock); return; }
 
     /* Send greeting */
     {
         const char *msg = "HELLO_FROM_DOS\n";
-        int len = strlen(msg);
-        int i;
-        for (i = 0; i < len; i++) sendbuf[i] = msg[i];
-        st = mux_sock_send(handle, sendbuf, (unsigned short)len);
+        n = send(sock, msg, (int)strlen(msg), 0);
     }
-    log_result("TCPOUT_SEND", st > 0, st > 0 ? "(sent)" : "(send failed)");
+    log_result("TCPOUT_SEND", n > 0, n > 0 ? "(sent)" : "(send failed)");
 
-    /* Drive mTCP to transmit the data */
-    mux_poll();
+    vsock_poll();
 
     /* Receive response (10 second timeout). */
     deadline = get_tick() + 182UL;
     while (get_tick() < deadline) {
-        int n;
         dos_idle();
-        mux_poll();
-        n = mux_sock_recv(handle, recvbuf + recv_total,
-                          (unsigned short)(sizeof(recvbuf) - 1 - recv_total));
+        n = recv(sock, recvbuf + recv_total,
+                 (int)(sizeof(recvbuf) - 1 - recv_total), 0);
         if (n > 0) {
             recv_total += n;
             recvbuf[recv_total] = '\0';
@@ -1187,10 +1108,9 @@ static void test_tcp_out(unsigned char ip0, unsigned char ip1,
                strstr((char *)recvbuf, "HELLO_FROM_HOST") != NULL,
                recv_total > 0 ? "(data received)" : "(no data)");
 
-    mux_sock_close(handle);
+    closesocket(sock);
     log_result("TCPOUT_CLOSE", 1, "(closed)");
 
-    /* Write result as ready flag — COMTEST.RDY is flushed to host via fclose */
     if (recv_total > 0 && strstr((char *)recvbuf, "HELLO_FROM_HOST") != NULL)
         write_ready_flag("TCPOUT_PASS");
     else
@@ -1213,13 +1133,13 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
                        unsigned char ip2, unsigned char ip3,
                        unsigned short port)
 {
-    int handle;
-    int st;
+    int sock;
+    int n;
+    struct sockaddr_in addr;
     unsigned long deadline, done_tick;
-    unsigned char ip[4];
     static unsigned char relaybuf[256];
-    int f2m_total = 0;  /* fossil-to-mux bytes relayed */
-    int m2f_total = 0;  /* mux-to-fossil bytes relayed */
+    int f2m_total = 0;  /* fossil-to-socket bytes relayed */
+    int m2f_total = 0;  /* socket-to-fossil bytes relayed */
 
     /* Step 1: Init FOSSIL on COM1 (port 0, matches /L:1:2323) */
     fossil_init_answer(0);
@@ -1234,55 +1154,55 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
     }
     log_result("RELAY_DCD", 1, "(connected)");
 
-    /* Step 2: Allocate ext socket and connect outgoing */
-    handle = mux_sock_alloc();
-    log_result("RELAY_ALLOC", handle >= 0,
-               handle >= 0 ? "(got handle)" : "(alloc failed)");
-    if (handle < 0) {
+    /* Step 2: Allocate socket and connect outgoing */
+    if (vsock_init() != 0) {
+        log_result("RELAY_ALLOC", 0, "(VMODEM not loaded)");
         fossil_deinit(0);
         write_ready_flag("RELAY_FAIL");
         return;
     }
 
-    ip[0] = ip0; ip[1] = ip1; ip[2] = ip2; ip[3] = ip3;
-    st = mux_sock_connect(handle, ip, port);
-    log_result("RELAY_CONNECT", st == 0,
-               st == 0 ? "(initiated)" : "(connect failed)");
-    if (st != 0) {
-        mux_sock_close(handle);
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    log_result("RELAY_ALLOC", sock >= 0,
+               sock >= 0 ? "(got socket)" : "(alloc failed)");
+    if (sock < 0) {
         fossil_deinit(0);
         write_ready_flag("RELAY_FAIL");
         return;
     }
 
-    /* Wait for outgoing connection (30 second timeout) */
-    deadline = get_tick() + 546UL;
-    while (get_tick() < deadline) {
-        fossil_status(0);
-        st = mux_sock_status(handle);
-        if (st == EXT_SOCK_ESTABLISHED) break;
-        if (st == EXT_SOCK_ERROR) break;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    {
+        unsigned char *p = (unsigned char *)&addr.sin_addr.s_addr;
+        p[0] = ip0; p[1] = ip1; p[2] = ip2; p[3] = ip3;
     }
-    log_result("RELAY_ESTABLISHED", st == EXT_SOCK_ESTABLISHED,
-               st == EXT_SOCK_ESTABLISHED ? "(connected)" : "(timeout/error)");
-    if (st != EXT_SOCK_ESTABLISHED) {
-        mux_sock_close(handle);
+
+    n = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    log_result("RELAY_ESTABLISHED", n == 0,
+               n == 0 ? "(connected)" : "(timeout/error)");
+    if (n != 0) {
+        closesocket(sock);
         fossil_deinit(0);
         write_ready_flag("RELAY_FAIL");
         return;
     }
+
+    /* Purge FOSSIL RX to clear RING/CONNECT modem responses so they
+     * don't get relayed and trigger done_tick prematurely. */
+    fossil_call(FOSSIL_PURGE_IN, 0, 0);
 
     /* Step 3: Bidirectional relay loop (30s max) */
     deadline = get_tick() + 546UL;
     done_tick = 0;
     while (get_tick() < deadline) {
-        int n;
         unsigned short fst;
 
         dos_idle();
         fst = fossil_status(0);  /* drives mTCP polling */
 
-        /* FOSSIL RX -> MUX send (batch available bytes) */
+        /* FOSSIL RX -> socket send (batch available bytes) */
         {
             int count = 0;
             while (count < (int)sizeof(relaybuf) && (fst & STATUS_RDA)) {
@@ -1292,13 +1212,13 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
                 fst = fossil_status(0);
             }
             if (count > 0) {
-                n = mux_sock_send(handle, relaybuf, (unsigned short)count);
+                n = send(sock, relaybuf, count, 0);
                 if (n > 0) f2m_total += n;
             }
         }
 
-        /* MUX recv -> FOSSIL TX */
-        n = mux_sock_recv(handle, relaybuf, (unsigned short)sizeof(relaybuf));
+        /* Socket recv -> FOSSIL TX */
+        n = recv(sock, relaybuf, (int)sizeof(relaybuf), 0);
         if (n > 0) {
             int i;
             for (i = 0; i < n; i++)
@@ -1329,7 +1249,7 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
     }
 
     /* Step 4: Close */
-    mux_sock_close(handle);
+    closesocket(sock);
     fossil_deinit(0);
     log_result("RELAY_CLOSE", 1, "(done)");
 
@@ -1420,6 +1340,10 @@ int main(int argc, char *argv[])
             unsigned char ip3 = argc > 5 ? (unsigned char)atoi(argv[5]) : 2;
             unsigned short port = argc > 6 ? (unsigned short)atoi(argv[6]) : 9998;
             test_relay(ip0, ip1, ip2, ip3, port);
+        }
+        else if (strcmp(upper, "DNS_RESOLVE") == 0) {
+            const char *host = argc > 2 ? argv[2] : "one.one.one.one";
+            test_dns_resolve(host);
         }
         else {
             printf("Unknown test: %s\n", upper);

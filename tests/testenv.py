@@ -90,7 +90,8 @@ class DOSBoxTestEnv:
         if os.path.exists(dhcp_src):
             shutil.copy2(dhcp_src, os.path.join(mtcp_dir, "dhcp.exe"))
         with open(os.path.join(mtcp_dir, "MTCP.CFG"), "w") as f:
-            f.write("packetint 0x60\nhostname vmodem-dos\n")
+            f.write("packetint 0x60\nhostname vmodem-dos\n"
+                    "NAMESERVER 10.0.2.3\n")
 
         # Copy test executables
         vm_dir = os.path.join(self.drive_c, "vmodem")

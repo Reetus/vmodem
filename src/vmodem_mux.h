@@ -36,6 +36,8 @@
 #define MUX_SOCK_RECV    0x14   /* CL=handle, DX=bufsz, ES:BX->buffer     */
 #define MUX_SOCK_CLOSE   0x15   /* CL=handle; ret AL=0                    */
 #define MUX_SOCK_RESULT  0x16   /* ret AX=last mux_sock_result            */
+#define MUX_SOCK_RESOLVE 0x17   /* ES:BX->hostname; initiates DNS query   */
+#define MUX_SOCK_RESOLVE_RESULT 0x18  /* ES:BX->4-byte IP buf; ret AL=state */
 
 #define MAX_EXT_SOCKETS  4
 
@@ -46,6 +48,12 @@
 #define EXT_SOCK_REMOTE_CLOSED 3
 #define EXT_SOCK_ERROR         4
 #define EXT_SOCK_CLOSING       5
+
+/* DNS resolve states (returned by MUX_SOCK_RESOLVE_RESULT) */
+#define DNS_RESOLVE_IDLE       0
+#define DNS_RESOLVE_PENDING    1
+#define DNS_RESOLVE_OK         2
+#define DNS_RESOLVE_ERROR      3
 
 #define VMODEM_SIG       "VMODEM10"
 #define VMODEM_SIG_LEN   8

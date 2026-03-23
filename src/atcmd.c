@@ -167,6 +167,11 @@ void at_set_ringing_silent(int port_idx)
         *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
 }
 
+void at_set_cmd_mode(int port_idx)
+{
+    g_at[port_idx].cmd_mode = 1;
+}
+
 /* -----------------------------------------------------------------------
  * at_check_ring — called from status/poll path to drive ring/auto-answer
  *
@@ -314,7 +319,46 @@ static void at_execute(int port_idx)
         c = cmd[i];
         if (c == ' ') { i++; continue; }
 
-        switch (c & 0xDF) {  /* force uppercase */
+        /* Handle non-alpha prefix chars before the switch.
+         * '&' (0x26), '\' (0x5C), '%' (0x25) are mangled by & 0xDF
+         * so they can't be matched in the switch. */
+        if (c == '&') {
+            /* AT& commands */
+            i++;
+            if (i < len) {
+                char subcmd = cmd[i];
+                int val = 0;
+                i++;
+                while (i < len && cmd[i] >= '0' && cmd[i] <= '9') {
+                    val = val * 10 + (cmd[i] - '0');
+                    i++;
+                }
+                if (subcmd == 'D' || subcmd == 'd') {
+                    /* &D0 = ignore DTR, &D2/&D3 = DTR drop disconnects */
+                    {
+                        int pi;
+                        for (pi = 0; pi < MAX_PORTS; pi++) {
+                            g_state.ports[pi].dtr_ignore =
+                                (val == 0) ? 1 : 0;
+                        }
+                    }
+                }
+                /* Other &commands silently accepted */
+            }
+            continue;
+        }
+        if (c == '\\' || c == '%') {
+            /* AT\ and AT% commands — skip subcmd + optional digits */
+            i++;
+            if (i < len) {
+                i++;
+                while (i < len && cmd[i] >= '0' && cmd[i] <= '9')
+                    i++;
+            }
+            continue;
+        }
+
+        switch (c & 0xDF) {  /* force uppercase (letters only) */
 
         case 'Z':  /* ATZ — reset to factory defaults */
             i++;
@@ -487,25 +531,6 @@ static void at_execute(int port_idx)
             i++;
             while (i < len && cmd[i] >= '0' && cmd[i] <= '9')
                 i++;
-            break;
-
-        case '&':  /* AT& commands — accept silently */
-            i++;
-            if (i < len) {
-                i++;  /* skip command letter */
-                while (i < len && cmd[i] >= '0' && cmd[i] <= '9')
-                    i++;
-            }
-            break;
-
-        case '\\': /* AT\ commands */
-        case '%':  /* AT% commands */
-            i++;
-            if (i < len) {
-                i++;
-                while (i < len && cmd[i] >= '0' && cmd[i] <= '9')
-                    i++;
-            }
             break;
 
         default:

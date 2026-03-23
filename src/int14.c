@@ -177,8 +177,10 @@ static unsigned short fossil_status(int port_idx)
          * Real modems raise DCD only when CONNECT is sent. */
     } else if (p->mode == PORT_CONN && p->sock != NULL) {
         /* Drop DCD after purge+status polling (BBS "Terminating Call").
-         * BBS sees DCD=0 and exits its DCD polling loop. */
-        if (g_purge_seen[port_idx] < 3)
+         * BBS sees DCD=0 and exits its DCD polling loop.
+         * But if &D0 is active (dtr_ignore), keep DCD up — the BBS
+         * is in door mode and needs carrier to stay asserted. */
+        if (g_purge_seen[port_idx] < 3 || p->dtr_ignore)
             msr |= 0x88;  /* DCD (bit 7) + DDCD (bit 3) */
     }
 
@@ -428,7 +430,8 @@ void __interrupt __far int14_real_handler(void)
          * Once we've seen enough, just drop DCD — fossil_status() checks
          * g_purge_seen and returns DCD=0.  The actual TCP close is handled
          * by the idle timeout in the normal poll cycle (INT 28h). */
-        if (g_purge_seen[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
+        if (g_purge_seen[port_idx] && p->mode == PORT_CONN && p->sock != NULL
+            && !p->dtr_ignore) {
             g_purge_seen[port_idx]++;
             if (g_purge_seen[port_idx] >= 3) {
                 dbg("[DCD-DROP]");
@@ -482,12 +485,16 @@ void __interrupt __far int14_real_handler(void)
             unsigned char was_ringing = at_is_ringing(port_idx);
             at_init(port_idx);
 
-            /* Only restore ringing if the call was unanswered (race
-             * condition: someone connected while BBS was restarting).
-             * For answered calls (was_ringing=0), leave ringing=0 so
-             * the BBS stays in data mode. */
-            if (was_ringing && p->mode == PORT_CONN && p->sock != NULL
-                && !p->pending_close) {
+            if (p->pending_close) {
+                /* Socket is being closed but hasn't been freed yet.
+                 * Force command mode so the BBS's AT init commands
+                 * go to the AT parser, not out the dying socket. */
+                at_set_cmd_mode(port_idx);
+            } else if (was_ringing && p->mode == PORT_CONN && p->sock != NULL) {
+                /* Only restore ringing if the call was unanswered (race
+                 * condition: someone connected while BBS was restarting).
+                 * For answered calls (was_ringing=0), leave ringing=0 so
+                 * the BBS stays in data mode. */
                 at_set_ringing_silent(port_idx);
             }
         }
@@ -564,11 +571,13 @@ void __interrupt __far int14_real_handler(void)
 
         /* If DTR is still raised and we have an active connection,
          * the BBS is terminating without explicitly dropping DTR.
-         * Close the TCP connection so the telnet client sees the hangup. */
-        if (g_dtr[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
+         * Close the TCP connection so the telnet client sees the hangup.
+         * But in &D0 mode (dtr_ignore), the BBS is just shelling to a
+         * door — keep the connection alive. */
+        if (p->dtr_ignore) {
+            dbg("[DEINIT-IGN]");
+        } else if (g_dtr[port_idx] && p->mode == PORT_CONN && p->sock != NULL) {
             dbg("[DEINIT-DISC]");
-            /* Don't close from INT 14h — packet driver can't transmit
-             * reliably here.  Set flag for next poll cycle (INT 28h). */
             p->pending_close = 1;
         }
         break;
@@ -591,10 +600,12 @@ void __interrupt __far int14_real_handler(void)
         }
 
         if (al == 0) {
-            /* DTR dropped — disconnect.
+            /* DTR dropped — disconnect unless &D0 mode is active.
              * Don't close from INT 14h — packet driver can't transmit
              * reliably here.  Set flag for next poll cycle (INT 28h). */
-            if (p->mode == PORT_CONN && p->sock != NULL) {
+            if (p->dtr_ignore) {
+                dbg("[DTR-IGN]");
+            } else if (p->mode == PORT_CONN && p->sock != NULL) {
                 dbg("[DTR-DISC]");
                 p->pending_close = 1;
             }
@@ -639,7 +650,8 @@ void __interrupt __far int14_real_handler(void)
          * BBS calls AH=09h during normal post-answer setup — without
          * the age check, DCD would drop right after CONNECT. */
         if (p->mode == PORT_CONN && p->sock != NULL
-            && g_purge_seen[port_idx] < 3) {
+            && g_purge_seen[port_idx] < 3
+            && !p->dtr_ignore) {
             unsigned long age = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C)
                                 - p->conn_tick;
             if (age > 182UL)  /* ~10 seconds */

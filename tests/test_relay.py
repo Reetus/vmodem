@@ -158,6 +158,9 @@ def test_relay():
             except OSError:
                 break
 
+        # Keep client connection open so relay has time to finish
+        # forwarding HELLO_FROM_CLIENT through VMODEM to the server.
+        time.sleep(3)
         client.close()
         env.wait_for_exit(timeout=30)
 

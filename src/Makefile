@@ -65,7 +65,7 @@ VMODEM_OBJS = vmodem.obj int14.obj int8.obj poll.obj telnet.obj ringbuf.obj atcm
 # Default target
 # -------------------------------------------------------------------------
 
-all : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe .symbolic
+all : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe vsocket.lib .symbolic
     @echo Build complete.
 
 # -------------------------------------------------------------------------
@@ -143,9 +143,20 @@ comdiag.obj : comdiag.c
 fosschk.obj : fosschk.c
     wpp fosschk -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
 
+# vsocket + comtest use large model (-ml) so the library can be linked
+# by any large-model DOS program (e.g. IRCJR).
+vsock_mm = -ml
+
+# vsocket: BSD socket library (no mTCP headers needed, uses MUX INT 2Fh)
+lib/vsocket.obj : lib/vsocket.c lib/vsocket.h
+    wpp lib/vsocket -0 $(vsock_mm) -fo=lib/vsocket.obj -i=. -zp2 -zpw -ei -s -we
+
+vsocket.lib : lib/vsocket.obj
+    wlib -n vsocket.lib +lib/vsocket.obj
+
 # comtest: DOS test helper for automated testing (no mTCP)
-comtest.obj : ../tests/comtest.c
-    wpp ../tests/comtest -0 $(memory_model) -fo=.obj -zp2 -zpw -ei -s -we
+comtest.obj : ../tests/comtest.c lib/vsocket.h
+    wpp ../tests/comtest -0 $(vsock_mm) -fo=.obj -i=. -zp2 -zpw -ei -s -we
 
 # -------------------------------------------------------------------------
 # Link VMODEM.EXE
@@ -191,26 +202,30 @@ fosschk.exe : fosschk.obj
         name $@ &
         file fosschk.obj
 
-comtest.exe : comtest.obj
+comtest.exe : comtest.obj vsocket.lib
     wlink &
         system dos &
         option map &
         option eliminate &
         name $@ &
-        file comtest.obj
+        file comtest.obj &
+        library vsocket.lib
 
 # -------------------------------------------------------------------------
 # Clean
 # -------------------------------------------------------------------------
 
-install : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe .symbolic
+install : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe vsocket.lib .symbolic
     @cp vmodem.exe ../../dosenv/vmodem/VMODEM.EXE
     @cp vmodctl.exe ../../dosenv/vmodem/VMODCTL.EXE
     @cp comdiag.exe ../../dosenv/vmodem/COMDIAG.EXE
     @cp fosschk.exe ../../dosenv/vmodem/FOSSCHK.EXE
     @cp comtest.exe ../../dosenv/vmodem/COMTEST.EXE
+    @cp vsocket.lib ../../dosenv/vmodem/VSOCKET.LIB
+    @cp lib/vsocket.h ../../dosenv/vmodem/VSOCKET.H
     @echo Installed to ../../dosenv/vmodem/
 
 clean : .symbolic
-    @rm -f *.obj *.o *.map *.err vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe
+    @rm -f *.obj *.o *.map *.err *.lib vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe
+    @rm -f lib/*.obj
     @echo Clean done.

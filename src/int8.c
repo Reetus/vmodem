@@ -490,6 +490,84 @@ void __interrupt __far int2f_handler(void)
         break;
     }
 
+    case MUX_SOCK_RESOLVE:
+    {
+        /* DNS hostname resolution.  ES:BX -> hostname string (max 63 chars).
+         * Copies hostname to DGROUP, initiates Dns::resolve().
+         * Result retrieved via MUX_SOCK_RESOLVE_RESULT.
+         * Uses two-step result protocol (see MUX_SOCK_RESULT). */
+        unsigned char __far *src;
+        int i;
+        int8_t rc;
+
+        __asm {
+            mov  ax, [bp+4]
+            mov  word ptr src+2, ax
+            mov  ax, [bp+16]
+            mov  word ptr src, ax
+        }
+
+        /* Copy hostname from caller's buffer to DGROUP */
+        for (i = 0; i < 63 && src[i] != 0; i++)
+            g_state.dns_hostname[i] = src[i];
+        g_state.dns_hostname[i] = '\0';
+
+        /* Initiate resolution */
+        rc = Dns::resolve(g_state.dns_hostname, g_state.dns_resolved_ip, 1);
+        if (rc == 0) {
+            /* Already resolved (cached or numeric IP) */
+            g_state.dns_resolve_state = DNS_RESOLVE_OK;
+            g_state.mux_sock_result = DNS_RESOLVE_OK;
+        } else if (rc == 1) {
+            /* Query sent, pending */
+            g_state.dns_resolve_state = DNS_RESOLVE_PENDING;
+            g_state.mux_sock_result = DNS_RESOLVE_PENDING;
+        } else {
+            /* Error (name too long, no nameserver, bad input) */
+            g_state.dns_resolve_state = DNS_RESOLVE_ERROR;
+            g_state.mux_sock_result = DNS_RESOLVE_ERROR;
+        }
+        break;
+    }
+
+    case MUX_SOCK_RESOLVE_RESULT:
+    {
+        /* Check DNS resolve status and copy result IP.
+         * If resolved: copies 4-byte IP to ES:BX, result = DNS_RESOLVE_OK.
+         * If pending: tries cache lookup, result = state.
+         * Uses two-step result protocol (see MUX_SOCK_RESULT). */
+        if (g_state.dns_resolve_state == DNS_RESOLVE_PENDING) {
+            /* Check if query completed — try cache-only lookup */
+            if (!Dns::isQueryPending()) {
+                int8_t rc = Dns::resolve(g_state.dns_hostname,
+                                          g_state.dns_resolved_ip, 0);
+                if (rc == 0) {
+                    g_state.dns_resolve_state = DNS_RESOLVE_OK;
+                } else {
+                    g_state.dns_resolve_state = DNS_RESOLVE_ERROR;
+                }
+            }
+        }
+
+        if (g_state.dns_resolve_state == DNS_RESOLVE_OK) {
+            /* Copy resolved IP to caller's buffer at ES:BX */
+            unsigned char __far *dst;
+            __asm {
+                mov  ax, [bp+4]
+                mov  word ptr dst+2, ax
+                mov  ax, [bp+16]
+                mov  word ptr dst, ax
+            }
+            dst[0] = g_state.dns_resolved_ip[0];
+            dst[1] = g_state.dns_resolved_ip[1];
+            dst[2] = g_state.dns_resolved_ip[2];
+            dst[3] = g_state.dns_resolved_ip[3];
+        }
+
+        g_state.mux_sock_result = g_state.dns_resolve_state;
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh

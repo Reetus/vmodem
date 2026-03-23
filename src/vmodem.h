@@ -105,7 +105,7 @@ typedef struct {
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
     unsigned char  pending_close;/* 1 = close socket on next poll cycle */
-    unsigned char  _pad1;       /* keep even alignment before conn_tick */
+    unsigned char  dtr_ignore;  /* 1 = ignore DTR drops (&D0 mode) */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
     unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */
@@ -179,6 +179,12 @@ typedef struct {
      * via MUX_SOCK_STATUS on handle 0xFE (special query).
      * Works around [bp+22] not reliably reflecting AX on return. */
     unsigned short mux_sock_result;
+
+    /* DNS resolve state for MUX_SOCK_RESOLVE */
+    unsigned char  dns_resolve_state;   /* DNS_RESOLVE_* */
+    unsigned char  dns_resolve_pad;
+    char           dns_hostname[64];    /* hostname being resolved */
+    IpAddr_t       dns_resolved_ip;     /* result IP address */
 } VModemState;
 
 /* StatusBlock is defined in vmodem_mux.h (shared with vmodctl, comdiag) */
@@ -244,6 +250,7 @@ void at_send_no_carrier(int port_idx);
 unsigned char at_get_s0(int port_idx);
 unsigned char at_is_ringing(int port_idx);
 void at_set_ringing_silent(int port_idx);
+void at_set_cmd_mode(int port_idx);
 unsigned char at_is_connect_pending(int port_idx);
 void at_check_ring(int port_idx);
 
