@@ -165,6 +165,20 @@ typedef struct {
         unsigned char  portMask;    /* bitmask of member COM ports (bits 0-3) */
         unsigned char  active;      /* 1 = configured */
     } huntGroups[MAX_HUNT_GROUPS];
+
+    /* External sockets: outgoing TCP via MUX_SOCK_* API */
+    struct {
+        TcpSocket     *sock;
+        unsigned char  state;    /* EXT_SOCK_* */
+        unsigned char  pending_connect; /* 1 = poll.c should call connectNonBlocking */
+        IpAddr_t       conn_ip;
+        uint16_t       conn_port;
+    } ext_sockets[MAX_EXT_SOCKETS];
+
+    /* MUX_SOCK return value — written by INT 2Fh handler, read by caller
+     * via MUX_SOCK_STATUS on handle 0xFE (special query).
+     * Works around [bp+22] not reliably reflecting AX on return. */
+    unsigned short mux_sock_result;
 } VModemState;
 
 /* StatusBlock is defined in vmodem_mux.h (shared with vmodctl, comdiag) */

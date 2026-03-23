@@ -43,6 +43,8 @@ from test_s0_register import test_s0_register
 from test_hunt_full import test_hunt_full
 from test_reconnect import test_reconnect
 from test_hunt_ring_timeout import test_hunt_ring_timeout
+from test_tcp_out import test_tcp_out
+from test_relay import test_relay
 
 
 ALL_TESTS = {
@@ -61,6 +63,8 @@ ALL_TESTS = {
     "test_hunt_full": test_hunt_full,
     "test_reconnect": test_reconnect,
     "test_hunt_ring_timeout": test_hunt_ring_timeout,
+    "test_tcp_out": test_tcp_out,
+    "test_relay": test_relay,
 }
 
 

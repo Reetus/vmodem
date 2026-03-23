@@ -390,17 +390,65 @@ void do_mtcp_poll(void)
         }
     }
 
+    /* Step 3: Service external sockets — update state tracking.
+     * Tcp::drivePackets() already drives all sockets globally;
+     * we just need to track state transitions here. */
+    for (i = 0; i < MAX_EXT_SOCKETS; i++) {
+        TcpSocket *es = g_state.ext_sockets[i].sock;
+        if (!es)
+            continue;
+
+        /* Handle deferred connect (set by MUX_SOCK_CONNECT in INT 2Fh) */
+        if (g_state.ext_sockets[i].pending_connect) {
+            static uint16_t ephemeral_port = 16384;
+            g_state.ext_sockets[i].pending_connect = 0;
+            if (++ephemeral_port > 32000) ephemeral_port = 16384;
+            if (es->connectNonBlocking(ephemeral_port,
+                    g_state.ext_sockets[i].conn_ip,
+                    g_state.ext_sockets[i].conn_port) != 0) {
+                g_state.ext_sockets[i].state = EXT_SOCK_ERROR;
+                dbg("[CONN-FAIL]");
+            } else {
+                dbg("[CONN-OK]");
+            }
+        }
+
+        /* Handle deferred close (set by MUX_SOCK_CLOSE in INT 2Fh).
+         * Done here where interrupts are enabled so close() can transmit FIN. */
+        if (g_state.ext_sockets[i].state == EXT_SOCK_CLOSING) {
+            es->close();
+            Tcp::drivePackets();
+            TcpSocketMgr::freeSocket(es);
+            g_state.ext_sockets[i].sock = NULL;
+            g_state.ext_sockets[i].state = EXT_SOCK_FREE;
+            dbg("[SOCK-CLOSE]");
+            continue;
+        }
+
+        if (g_state.ext_sockets[i].state == EXT_SOCK_CONNECTING) {
+            if (es->isConnectComplete())
+                g_state.ext_sockets[i].state = EXT_SOCK_ESTABLISHED;
+            else if (es->isClosed())
+                g_state.ext_sockets[i].state = EXT_SOCK_ERROR;
+        } else if (g_state.ext_sockets[i].state == EXT_SOCK_ESTABLISHED) {
+            if (es->isClosed())
+                g_state.ext_sockets[i].state = EXT_SOCK_ERROR;
+            else if (es->isRemoteClosed() && !es->recvDataWaiting())
+                g_state.ext_sockets[i].state = EXT_SOCK_REMOTE_CLOSED;
+        }
+    }
+
     /* Flush debug log to disk if file is open and DOS I/O is safe.
      * Safe when: g_dos_safe=1 (INT 28h context — DOS is idle, file I/O OK)
-     *         or InDOS=0 (no DOS call in progress, e.g. INT 14h from user code)
      *         or g_int14_safe=1 (INT 14h caller context — software interrupt,
      *            user code invoked us so DOS I/O is safe).
+     * NOT safe from INT 1Ch (timer tick) — doing INT 21h file I/O from
+     * hardware interrupt context crashes under JemmEx V86 mode.
      * Note: during INT 28h, InDOS is typically 1 (DOS is inside a keyboard read),
      * so we must check g_dos_safe separately.
      * We're on the private stack (SS == DS) so C library calls work. */
     if (g_state.dbglog_fd >= 0 &&
-        (g_dos_safe || g_int14_safe ||
-         (g_indos_ptr != NULL && *g_indos_ptr == 0))) {
+        (g_dos_safe || g_int14_safe)) {
         static unsigned short last_h = 0;
         unsigned short h = g_state.dbglog_head;
         if (h != last_h) {

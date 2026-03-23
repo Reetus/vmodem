@@ -624,10 +624,11 @@ int main(int argc, char *argv[])
                s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],
                s[8],s[9],s[10],s[11],s[12],s[13]);
 
-        _disable();
-        *(unsigned short __far *)MK_FP(0x0000, 0x0050) = stub_off;
-        *(unsigned short __far *)MK_FP(0x0000, 0x0052) = stub_seg;
-        _enable();
+        /* Use DOS INT 21h AH=25h to set INT 14h vector.
+         * Direct IVT writes (MK_FP(0,0x50)) are not tracked by JemmEx's
+         * V86 monitor, causing corrupt dispatch under memory managers. */
+        _dos_setvect(0x14,
+            (void (__interrupt __far *)()) MK_FP(stub_seg, stub_off));
     }
     _dos_setvect(0x28, int28_handler);
     _dos_setvect(0x2F, int2f_handler);

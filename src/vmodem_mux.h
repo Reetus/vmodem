@@ -28,6 +28,25 @@
 #define MUX_HUNT_LISTEN  0x07   /* CL=portMask, DX=TCP port              */
 #define MUX_UNLOAD       0xFF   /* restore vectors, mark unloaded        */
 
+/* ---- External socket API (outgoing TCP via VMODEM's mTCP stack) ---- */
+#define MUX_SOCK_ALLOC   0x10   /* allocate socket; ret AL=handle or 0xFF */
+#define MUX_SOCK_CONNECT 0x11   /* CL=handle, DX=port, ES:BX->4-byte IP  */
+#define MUX_SOCK_STATUS  0x12   /* CL=handle; ret AL=state                */
+#define MUX_SOCK_SEND    0x13   /* CL=handle, DX=len, ES:BX->data         */
+#define MUX_SOCK_RECV    0x14   /* CL=handle, DX=bufsz, ES:BX->buffer     */
+#define MUX_SOCK_CLOSE   0x15   /* CL=handle; ret AL=0                    */
+#define MUX_SOCK_RESULT  0x16   /* ret AX=last mux_sock_result            */
+
+#define MAX_EXT_SOCKETS  4
+
+/* External socket states (returned by MUX_SOCK_STATUS) */
+#define EXT_SOCK_FREE          0
+#define EXT_SOCK_CONNECTING    1
+#define EXT_SOCK_ESTABLISHED   2
+#define EXT_SOCK_REMOTE_CLOSED 3
+#define EXT_SOCK_ERROR         4
+#define EXT_SOCK_CLOSING       5
+
 #define VMODEM_SIG       "VMODEM10"
 #define VMODEM_SIG_LEN   8
 

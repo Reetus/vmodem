@@ -309,6 +309,187 @@ void __interrupt __far int2f_handler(void)
         break;
     }
 
+    /* ----------------------------------------------------------------
+     * MUX_SOCK_* — External socket API
+     *
+     * Lets non-mTCP DOS programs make outgoing TCP connections by
+     * piggybacking on VMODEM's already-running mTCP stack.
+     * ---------------------------------------------------------------- */
+
+    case MUX_SOCK_ALLOC:
+    {
+        TcpSocket *ns;
+        int slot, j;
+        slot = -1;
+        for (j = 0; j < MAX_EXT_SOCKETS; j++) {
+            if (g_state.ext_sockets[j].state == EXT_SOCK_FREE &&
+                g_state.ext_sockets[j].sock == NULL) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot < 0) {
+            g_state.mux_sock_result = 0xFF;
+            break;
+        }
+        ns = TcpSocketMgr::getSocket();
+        if (!ns) {
+            g_state.mux_sock_result = 0xFF;
+            break;
+        }
+        if (ns->setRecvBuffer(512) != 0) {
+            dbg("[ALLOC-NOMEM]");
+            TcpSocketMgr::freeSocket(ns);
+            g_state.mux_sock_result = 0xFF;
+            break;
+        }
+        g_state.ext_sockets[slot].sock = ns;
+        g_state.ext_sockets[slot].state = EXT_SOCK_FREE;
+        g_state.mux_sock_result = (unsigned short)slot;
+        dbg("[SOCK-ALLOC]");
+        break;
+    }
+
+    case MUX_SOCK_CONNECT:
+    {
+        unsigned char handle;
+        unsigned short dport;
+        handle = (unsigned char)(orig_cx & 0xFF);
+        dport = (unsigned short)orig_dx;
+        if (handle >= MAX_EXT_SOCKETS || g_state.ext_sockets[handle].sock == NULL) {
+            g_state.mux_sock_result = 0xFF;
+            break;
+        }
+        {
+            unsigned char __far *ipfar;
+            ipfar = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+            /* Store connect params — poll.c does the actual connectNonBlocking */
+            g_state.ext_sockets[handle].conn_ip[0] = ipfar[0];
+            g_state.ext_sockets[handle].conn_ip[1] = ipfar[1];
+            g_state.ext_sockets[handle].conn_ip[2] = ipfar[2];
+            g_state.ext_sockets[handle].conn_ip[3] = ipfar[3];
+            g_state.ext_sockets[handle].conn_port = dport;
+            g_state.ext_sockets[handle].pending_connect = 1;
+            g_state.ext_sockets[handle].state = EXT_SOCK_CONNECTING;
+        }
+        g_state.mux_sock_result = 0;
+        dbg("[SOCK-CONN]");
+        break;
+    }
+
+    case MUX_SOCK_STATUS:
+    {
+        unsigned char handle;
+        unsigned char st;
+        handle = (unsigned char)(orig_cx & 0xFF);
+        st = EXT_SOCK_ERROR;
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL) {
+            TcpSocket *s;
+            s = g_state.ext_sockets[handle].sock;
+            if (s->isConnectComplete())
+                st = EXT_SOCK_ESTABLISHED;
+            else if (s->isClosed())
+                st = EXT_SOCK_ERROR;
+            else if (g_state.ext_sockets[handle].state == EXT_SOCK_CONNECTING)
+                st = EXT_SOCK_CONNECTING;
+            else
+                st = g_state.ext_sockets[handle].state;
+
+            if (st == EXT_SOCK_ESTABLISHED && s->isRemoteClosed() &&
+                !s->recvDataWaiting())
+                st = EXT_SOCK_REMOTE_CLOSED;
+
+            g_state.ext_sockets[handle].state = st;
+        }
+        g_state.mux_sock_result = (unsigned short)st;
+        break;
+    }
+
+    case MUX_SOCK_SEND:
+    {
+        unsigned char handle;
+        unsigned short len;
+        static unsigned char mux_sendbuf[256];
+        unsigned short sent;
+        handle = (unsigned char)(orig_cx & 0xFF);
+        len = (unsigned short)orig_dx;
+        sent = 0;
+
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL
+            && g_state.ext_sockets[handle].state == EXT_SOCK_ESTABLISHED) {
+            unsigned char __far *src;
+            unsigned short i;
+            int16_t rc;
+            src = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+            if (len > 256) len = 256;
+            for (i = 0; i < len; i++)
+                mux_sendbuf[i] = src[i];
+            rc = g_state.ext_sockets[handle].sock->send(mux_sendbuf, len);
+            if (rc > 0) sent = (unsigned short)rc;
+        }
+        g_state.mux_sock_result = sent;
+        break;
+    }
+
+    case MUX_SOCK_RECV:
+    {
+        unsigned char handle;
+        unsigned short bufsz;
+        static unsigned char mux_recvbuf[256];
+        unsigned short got;
+        handle = (unsigned char)(orig_cx & 0xFF);
+        bufsz = (unsigned short)orig_dx;
+        got = 0;
+
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL) {
+            int16_t rc;
+            if (bufsz > 256) bufsz = 256;
+            if (g_state.ext_sockets[handle].sock->recvDataWaiting()) {
+                rc = g_state.ext_sockets[handle].sock->recv(mux_recvbuf, bufsz);
+                if (rc > 0) {
+                    unsigned char __far *dst;
+                    unsigned short i;
+                    dst = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+                    got = (unsigned short)rc;
+                    for (i = 0; i < got; i++)
+                        dst[i] = mux_recvbuf[i];
+                    dbg("[RX+]");
+                }
+            }
+        }
+        g_state.mux_sock_result = got;
+        break;
+    }
+
+    case MUX_SOCK_CLOSE:
+    {
+        /* Mark for deferred close — the actual close()+freeSocket() happens
+         * in poll.c where interrupts are enabled and drivePackets can send
+         * FIN packets.  Doing close() inside INT 2Fh (IF=0) hangs because
+         * mTCP's close() needs the packet driver ISR to transmit. */
+        unsigned char handle;
+        handle = (unsigned char)(orig_cx & 0xFF);
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL) {
+            g_state.ext_sockets[handle].state = EXT_SOCK_CLOSING;
+            dbg("[SOCK-CLOSEREQ]");
+        }
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
+    case MUX_SOCK_RESULT:
+    {
+        /* Return last mux_sock_result in AX — no function calls here,
+         * so [bp+22] write works reliably (unlike cases with C++ calls). */
+        unsigned short res;
+        res = g_state.mux_sock_result;
+        __asm {
+            mov  ax, res
+            mov  [bp+22], ax
+        }
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh
