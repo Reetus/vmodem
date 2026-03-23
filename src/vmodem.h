@@ -212,6 +212,7 @@ extern "C" {
 }
 int fossil_is_init(int port_idx); /* 1 if AH=04h was called, 0 after AH=05h */
 int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
+void fossil_clear_tx(int port_idx); /* discard any buffered TX data */
 
 /* int8.c */
 void __interrupt __far int1c_handler(void);
@@ -228,6 +229,7 @@ void at_send_connect(int port_idx);
 void at_send_no_carrier(int port_idx);
 unsigned char at_get_s0(int port_idx);
 unsigned char at_is_ringing(int port_idx);
+void at_set_ringing_silent(int port_idx);
 unsigned char at_is_connect_pending(int port_idx);
 void at_check_ring(int port_idx);
 

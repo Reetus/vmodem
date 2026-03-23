@@ -201,12 +201,23 @@ int fossil_is_init(int port_idx)
     return g_fossil_init[port_idx];
 }
 
+void fossil_clear_tx(int port_idx)
+{
+    if (port_idx >= 0 && port_idx < MAX_PORTS)
+        txring_init(&g_tx[port_idx]);
+}
+
 int fossil_flush_tx(int port_idx)
 {
     PortState *p = &g_state.ports[port_idx];
     TxRing *t = &g_tx[port_idx];
     int sent = 0;
     int b;
+
+    /* Don't send TX data while ringing — the call hasn't been answered yet.
+     * BBS AT commands should be consumed by at_input, but guard here too. */
+    if (at_is_ringing(port_idx) || at_is_connect_pending(port_idx))
+        return 0;
 
     /* Allow sending in ESTABLISHED or CLOSE_WAIT — in CLOSE_WAIT the
      * remote sent FIN but we can still transmit.  DOSBox-X SLIRP port
@@ -344,7 +355,7 @@ void __interrupt __far int14_real_handler(void)
         at_rc = at_input(port_idx, byte_to_send);
         if (at_rc == 0) {
             /* Data mode — send to TCP via TX ring */
-            if (p->mode == PORT_CONN && p->sock != NULL) {
+            if (p->mode == PORT_CONN && p->sock != NULL && !at_is_ringing(port_idx)) {
                 if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
                     fossil_flush_tx(port_idx);
                     if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
@@ -441,12 +452,15 @@ void __interrupt __far int14_real_handler(void)
         ring_init(&p->rx);
         txring_init(&g_tx[port_idx]);
 
-        /* If DCD was dropped (purge_seen >= 3) and the socket is still
-         * open, defer close to the poll cycle (INT 28h) where the packet
-         * driver can transmit reliably. */
-        if (g_purge_seen[port_idx] >= 3 && p->mode == PORT_CONN && p->sock != NULL) {
+        /* If an old connection is pending close (from DEINIT or DCD-drop),
+         * keep it deferred to the poll cycle (packet driver works better
+         * there), but mark it "silent" so POLL-CLOSE won't inject
+         * NO CARRIER into the RX ring — the BBS is doing a fresh init
+         * and doesn't need to see stale disconnect messages. */
+        if (p->pending_close || (p->mode == PORT_CONN && p->sock != NULL
+            && g_purge_seen[port_idx] >= 3)) {
             dbg("[INIT-DISC]");
-            p->pending_close = 1;
+            p->pending_close = 2;  /* 2 = silent close (no NO CARRIER) */
         }
 
         /* Reset state */
@@ -460,9 +474,23 @@ void __interrupt __far int14_real_handler(void)
             p->last_tx_tick = now;
             p->last_rx_tick = now;
             p->idle_timeout = 30;  /* default 30 second idle timeout */
-            /* Don't clear pending_close here — poll cycle needs to see it */
         }
-        at_init(port_idx);
+        /* Save ringing state before at_init clears it.  RA calls
+         * FOSSIL INIT after answering a call (F:04 post-CONNECT) —
+         * we must NOT re-enter ringing on an already-answered call. */
+        {
+            unsigned char was_ringing = at_is_ringing(port_idx);
+            at_init(port_idx);
+
+            /* Only restore ringing if the call was unanswered (race
+             * condition: someone connected while BBS was restarting).
+             * For answered calls (was_ringing=0), leave ringing=0 so
+             * the BBS stays in data mode. */
+            if (was_ringing && p->mode == PORT_CONN && p->sock != NULL
+                && !p->pending_close) {
+                at_set_ringing_silent(port_idx);
+            }
+        }
 
         /* Start TCP listen if configured and not already listening.
          * Deferred from cmd_listen() so connections can't arrive

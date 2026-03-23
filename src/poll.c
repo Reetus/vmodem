@@ -119,6 +119,7 @@ void do_mtcp_poll(void)
             tp->last_rx_tick = tp->conn_tick;
             tp->last_tx_tick = tp->conn_tick;
             ring_init(&tp->rx);
+            fossil_clear_tx(target);
             telnet_on_connect(target);
             telnet_send_text(target, "\r\nRinging the host, please wait...\r\n");
             at_send_ring(target);
@@ -165,6 +166,7 @@ void do_mtcp_poll(void)
                 p->last_rx_tick = p->conn_tick;
                 p->last_tx_tick = p->conn_tick;
                 ring_init(&p->rx);
+                fossil_clear_tx(i);  /* discard stale TX data from previous session */
                 telnet_on_connect(i);
 
                 /* Notify the telnet caller that we're ringing */
@@ -246,9 +248,11 @@ void do_mtcp_poll(void)
              * both are software-interrupt contexts with interrupts enabled,
              * so the packet driver IRQ can fire. */
             if (p->pending_close && (g_dos_safe || g_int14_safe)) {
-                dbg("[POLL-CLOSE]");
+                unsigned char silent = (p->pending_close >= 2);
+                dbg(silent ? "[POLL-CLOSE-S]" : "[POLL-CLOSE]");
                 p->pending_close = 0;
-                telnet_send_text(i, "\r\nSession finished.\r\n");
+                if (!silent)
+                    telnet_send_text(i, "\r\nSession finished.\r\n");
                 Tcp::drivePackets();
                 p->sock->close();
                 Tcp::drivePackets();
@@ -257,7 +261,8 @@ void do_mtcp_poll(void)
                 memset(p->remoteIP, 0, 4);
                 p->remotePort = 0;
                 ring_init(&p->rx);
-                at_send_no_carrier(i);
+                if (!silent)
+                    at_send_no_carrier(i);
                 /* Keep the listen socket alive — RA's batch file will
                  * loop back and restart RA, which calls AH=04h.
                  * The port goes to PORT_LISTEN so it can accept new
@@ -274,15 +279,26 @@ void do_mtcp_poll(void)
             /* Flush any buffered TX data from the FOSSIL TX ring */
             fossil_flush_tx(i);
 
+            /* Only deliver TCP data to the RX ring after the call is
+             * answered.  While ringing or during connect handshake,
+             * discard application data but still process telnet IAC
+             * negotiation so the connection stays healthy. */
             while (p->sock->recvDataWaiting()) {
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
                     int j;
                     p->last_rx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
-                    for (j = 0; j < n; j++) {
-                        int b = telnet_filter(p, tmp[j]);
-                        if (b >= 0)
-                            ring_put(&p->rx, (unsigned char)b);
+                    if (at_is_ringing(i) || at_is_connect_pending(i)) {
+                        /* Pre-answer: run telnet filter (handles IAC)
+                         * but drop the application bytes */
+                        for (j = 0; j < n; j++)
+                            telnet_filter(p, tmp[j]);
+                    } else {
+                        for (j = 0; j < n; j++) {
+                            int b = telnet_filter(p, tmp[j]);
+                            if (b >= 0)
+                                ring_put(&p->rx, (unsigned char)b);
+                        }
                     }
                 } else {
                     break;

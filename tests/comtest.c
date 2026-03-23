@@ -139,6 +139,26 @@ static void fossil_tx_string(int port, const char *s)
         fossil_tx(port, (unsigned char)*s++);
 }
 
+/* Init FOSSIL and enable auto-answer on first ring.
+ * s0 defaults to 0 after init; most tests need auto-answer enabled. */
+static unsigned short fossil_init_answer(int port)
+{
+    unsigned short ax = fossil_init(port);
+    if (ax == 0x1954) {
+        fossil_tx_string(port, "ATS0=1\r");
+        {
+            unsigned long t;
+            t = *(volatile unsigned long far *)MK_FP(0x0040, 0x006C) + 18UL;
+            while (*(volatile unsigned long far *)MK_FP(0x0040, 0x006C) < t) {
+                union REGS r;
+                r.h.ah = 0x0B;
+                int86(0x21, &r, &r);
+            }
+        }
+    }
+    return ax;
+}
+
 /* ---- Wait helpers ---- */
 
 static unsigned long get_tick(void)
@@ -247,7 +267,7 @@ static void test_echo(void)
     char buf[128];
     int buf_len = 0;
 
-    fossil_init(0);
+    fossil_init_answer(0);
     log_info("ECHO: waiting for DCD (connection)...");
     write_ready_flag("ECHO_WAITING_DCD");
 
@@ -303,7 +323,7 @@ static void test_full_cycle(void)
     unsigned long deadline;
 
     /* Step 1: Init */
-    ax = fossil_init(0);
+    ax = fossil_init_answer(0);
     log_result("CYCLE_INIT", ax == 0x1954, "(FOSSIL init)");
 
     /* Step 2: Wait for connection */
@@ -349,7 +369,7 @@ static void test_full_cycle(void)
 
 static void test_send_text(const char *text)
 {
-    fossil_init(0);
+    fossil_init_answer(0);
     log_info("SEND_TEXT: waiting for DCD...");
     write_ready_flag("SEND_WAITING_DCD");
 
@@ -404,10 +424,10 @@ static void test_hunt_group(void)
     int len1 = 0, len2 = 0;
 
     /* Step 1: Init both ports */
-    ax = fossil_init(0);
+    ax = fossil_init_answer(0);
     log_result("HUNT_INIT_COM1", ax == 0x1954, "(FOSSIL init COM1)");
 
-    ax = fossil_init(1);
+    ax = fossil_init_answer(1);
     log_result("HUNT_INIT_COM2", ax == 0x1954, "(FOSSIL init COM2)");
 
     /* Step 2: Signal ready for first connection */
@@ -526,7 +546,7 @@ static void test_idle_timeout(void)
      * Verify DCD drops and port returns to PORT_LISTEN (mode=1). */
     unsigned char mode;
 
-    fossil_init(0);
+    fossil_init_answer(0);
     log_info("IDLE_TIMEOUT: waiting for connection...");
     write_ready_flag("IDLE_WAITING_DCD");
 
@@ -563,7 +583,7 @@ static void test_dtr_disconnect(void)
      * Verify port returns to PORT_LISTEN. */
     unsigned char mode;
 
-    fossil_init(0);
+    fossil_init_answer(0);
     log_info("DTR_DISC: waiting for connection...");
     write_ready_flag("DTR_WAITING_DCD");
 
@@ -641,7 +661,7 @@ static void test_mux_port_status(void)
     unsigned char mode, rip[4];
     unsigned short rport;
 
-    fossil_init(0);
+    fossil_init_answer(0);
     log_info("MUX_PORT: waiting for connection...");
     write_ready_flag("MUX_PORT_WAITING_DCD");
 
@@ -739,9 +759,9 @@ static void test_hunt_full(void)
      * COMTEST just inits and echoes — Python verifies the 3rd rejection. */
     unsigned short ax;
 
-    ax = fossil_init(0);
+    ax = fossil_init_answer(0);
     log_result("HUNTFULL_INIT_COM1", ax == 0x1954, "(FOSSIL init COM1)");
-    ax = fossil_init(1);
+    ax = fossil_init_answer(1);
     log_result("HUNTFULL_INIT_COM2", ax == 0x1954, "(FOSSIL init COM2)");
 
     log_info("HUNTFULL: waiting for first connection on COM1...");
@@ -788,7 +808,7 @@ static void test_reconnect(void)
     unsigned short ax;
     unsigned long deadline;
 
-    ax = fossil_init(0);
+    ax = fossil_init_answer(0);
     log_result("RECONN_INIT", ax == 0x1954, "(FOSSIL init)");
 
     /* First connection */

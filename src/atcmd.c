@@ -159,6 +159,14 @@ unsigned char at_is_connect_pending(int port_idx)
     return g_at[port_idx].connect_pending;
 }
 
+void at_set_ringing_silent(int port_idx)
+{
+    g_at[port_idx].ringing = 1;
+    g_at[port_idx].rings_sent = 0;
+    g_at[port_idx].ring_tick =
+        *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+}
+
 /* -----------------------------------------------------------------------
  * at_check_ring — called from status/poll path to drive ring/auto-answer
  *
@@ -261,7 +269,7 @@ void at_init(int port_idx)
     memset(at, 0, sizeof(AtState));
     at->echo    = 1;
     at->verbose = 1;
-    at->s0      = 1;   /* auto-answer on first ring (when FOSSIL is initialized) */
+    at->s0      = 0;   /* auto-answer off until BBS explicitly sets ATS0=n */
 }
 
 /* -----------------------------------------------------------------------
@@ -354,14 +362,21 @@ static void at_execute(int port_idx)
             }
             break;
 
-        case 'H':  /* ATH — hangup */
+        case 'H':  /* ATH — hangup (go on-hook) */
             i++;
             if (i < len && cmd[i] >= '0' && cmd[i] <= '9')
                 i++;
             at->cmd_mode = 0;
             at->plus_count = 0;
+            if (at->ringing) {
+                /* Ringing but not answered — we're already on-hook.
+                 * ATH0 is a no-op here (real modem behavior).
+                 * Continue parsing the rest of the command line so
+                 * BBS init strings like ATH0S0=0M0 still process. */
+                break;
+            }
             if (p->mode == PORT_CONN && p->sock != NULL) {
-                /* Close data socket but preserve listen socket */
+                /* Answered call — disconnect */
                 fossil_flush_tx(port_idx);
                 p->sock->close();
                 TcpSocketMgr::freeSocket(p->sock);
