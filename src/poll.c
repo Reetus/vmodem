@@ -48,7 +48,10 @@ void do_mtcp_poll(void)
     int i;
 
     g_state.poll_count++;
+
     g_state.poll_phase = 0;  /* entering poll */
+    if (g_state.poll_count <= 3)
+        dbg("[POLL]");
 
     /* Step 0: Periodic ARP keepalive for SLIRP/pcap.
      * Send ARP request every ~1 second to keep the path active. */

@@ -261,7 +261,7 @@ int fossil_flush_tx(int port_idx)
  * here. This function has the full Watcom __interrupt prologue/epilogue.
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int14_real_handler(void)
+void __interrupt __far __loadds int14_real_handler(void)
 {
     unsigned short orig_ax;
     unsigned short orig_cx;
@@ -292,6 +292,8 @@ void __interrupt __far int14_real_handler(void)
 
     port_idx = (unsigned char)(orig_dx & 0xFF);
     func     = (unsigned char)(orig_ax >> 8);
+
+    /* Port and function extraction */
 
     /* DX=00FFh is a special case — do non-comm processing, return success */
     if (port_idx == 0xFF) {
@@ -352,6 +354,7 @@ void __interrupt __far int14_real_handler(void)
     {
         unsigned char byte_to_send = (unsigned char)(orig_ax & 0xFF);
         int at_rc;
+        /* TX character handling */
         p->last_tx_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
 
         /* Try AT command parser first — it returns 1 if the byte was

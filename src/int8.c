@@ -123,7 +123,7 @@ void poll_on_priv_stack(void)
  * Stack switch and busy flag: identical to int28_handler.
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int1c_handler(void)
+void __interrupt __far __loadds int1c_handler(void)
 {
     _chain_intr(old_int1c);
 }
@@ -135,7 +135,7 @@ void __interrupt __far int1c_handler(void)
  * stack and chains to the previous INT 28h handler.
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int28_handler(void)
+void __interrupt __far __loadds int28_handler(void)
 {
     if (g_state.busy) {
         /* Already inside a poll — skip to avoid recursion */
@@ -180,7 +180,7 @@ void __interrupt __far int28_handler(void)
  *   [bp+4]  = ES (segment for MUX_STATUS buffer)
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int2f_handler(void)
+void __interrupt __far __loadds int2f_handler(void)
 {
     unsigned short orig_ax;
     unsigned short orig_cx;

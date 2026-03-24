@@ -559,6 +559,7 @@ int at_input(int port_idx, unsigned char b)
     PortState *p = &g_state.ports[port_idx];
     AtState *at = &g_at[port_idx];
 
+
     /* +++ escape sequence detection.
      * Real Hayes: 1s silence, +++, 1s silence.
      * Virtual modem: we only require the leading guard time (~0.5s).

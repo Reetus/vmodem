@@ -28,7 +28,7 @@ INC       = $(MTCP_ROOT)/INCLUDE
 # Compiler / Assembler flags
 # -------------------------------------------------------------------------
 
-memory_model = -ms
+memory_model = -ml
 
 # Note: use \"...\" so that CFG_H expands to "vmodem.cfg" (with quotes).
 # -fo=.obj: on Linux the OW compiler defaults to .o; force DOS OMF .obj output.
@@ -37,14 +37,14 @@ compile_opts = -0 $(memory_model) &
     -DCFG_H=\"vmodem.cfg\" &
     -fo=.obj &
     -i=$(TCPINC) -i=$(INC) -i=. &
-    -zp2 -zpw -ei -s -d2
+    -zp2 -zpw -zu -ei -s -d2
 !else
 compile_opts = -0 $(memory_model) &
     -DCFG_H=\"vmodem.cfg\" &
     -fo=.obj &
     -oh -os -oa &
     -i=$(TCPINC) -i=$(INC) -i=. &
-    -zp2 -zpw -ei -s -we
+    -zp2 -zpw -zu -ei -s -we
 !endif
 
 asm_opts = -0 $(memory_model)

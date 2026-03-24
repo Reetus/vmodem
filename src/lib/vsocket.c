@@ -83,8 +83,8 @@ static int mux_sock_connect(int handle, unsigned char *ip,
     mux_staging[2] = ip[2]; mux_staging[3] = ip[3];
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_CONNECT
         mov  cl, h
@@ -116,8 +116,8 @@ static int mux_sock_send(int handle, unsigned char *data,
     (void)data;  /* caller must pre-fill mux_staging[] */
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP (mux_staging is in DGROUP) */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_SEND
         mov  cl, h
@@ -138,8 +138,8 @@ static int mux_sock_recv(int handle, unsigned char *buf,
     (void)buf;  /* caller must read mux_staging[] after call */
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RECV
         mov  cl, h
@@ -453,8 +453,8 @@ static int mux_resolve_start(const char *hostname)
     (void)hostname;
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RESOLVE
         lea  bx, s_hostname
@@ -471,8 +471,8 @@ static int mux_resolve_result(unsigned char *ip_buf)
     (void)ip_buf;
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RESOLVE_RESULT
         lea  bx, mux_staging

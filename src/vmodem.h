@@ -228,16 +228,16 @@ void telnet_send_text(int port_idx, const char *msg);
 
 /* int14.c */
 extern "C" {
-    void __interrupt __far int14_real_handler(void);  /* FOSSIL INT 14h handler */
+    void __interrupt __far __loadds int14_real_handler(void);  /* FOSSIL INT 14h handler */
 }
 int fossil_is_init(int port_idx); /* 1 if AH=04h was called, 0 after AH=05h */
 int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
 void fossil_clear_tx(int port_idx); /* discard any buffered TX data */
 
 /* int8.c */
-void __interrupt __far int1c_handler(void);
-void __interrupt __far int28_handler(void);
-void __interrupt __far int2f_handler(void);
+void __interrupt __far __loadds int1c_handler(void);
+void __interrupt __far __loadds int28_handler(void);
+void __interrupt __far __loadds int2f_handler(void);
 void do_mtcp_poll(void);
 void poll_on_priv_stack(void);
 
