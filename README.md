@@ -145,7 +145,7 @@ wmake install
 wmake clean
 ```
 
-All source files are compiled with `wpp` (C++ mode) to link against mTCP's C++ objects. Small memory model (`-ms`) is used to keep near pointers in DGROUP so the TSR stays compact after `_dos_keep()`.
+All source files are compiled with `wpp` (C++ mode) to link against mTCP's C++ objects. Large memory model (`-ml`) is used with the `-zu` flag (SS != DGROUP) so the far heap can use all available conventional memory beyond the 64 KB DGROUP segment.
 
 ### Linux Cross-Compilation Notes
 
@@ -240,7 +240,7 @@ Tests run inside DOSBox-X with slirp networking. The Python harness launches DOS
 | **INT 28h** | DOS idle hook — drives mTCP polling (stack switch to private 16 KB stack) |
 | **INT 2Fh** | Multiplex — AH=C3h for runtime control (listen, connect, disconnect, status) |
 
-INT 28h is used for polling instead of INT 8 (timer tick) because mTCP already hooks INT 1Ch via INT 8. The private stack switch is necessary because the TSR's DGROUP stack is too small for mTCP's processing.
+INT 28h is used for polling instead of INT 8 (timer tick) because mTCP already hooks INT 1Ch via INT 8. The private stack switch is necessary because interrupt handlers run on the interrupted program's stack (SS != DGROUP in large model), and mTCP's processing needs a known-good stack in DGROUP.
 
 ### FOSSIL Interface
 
@@ -308,11 +308,11 @@ VMODEM /L:1-4:2323    Four COM ports share TCP port 2323
 
 ### Memory Model
 
-Small model (`-ms`) with near data pointers. All mTCP buffers are allocated from `near malloc` to stay within the 64 KB DGROUP segment. The TSR footprint is kept minimal so `_dos_keep()` only reserves what's needed.
+Large model (`-ml`) with far code and data pointers. The `-zu` compiler flag is critical — it tells Watcom that SS may not equal DGROUP, preventing the compiler from generating `push ss; pop ds` to load DGROUP (which fails in interrupt handlers where SS belongs to the interrupted program). All interrupt handlers use `__loadds` to explicitly set DS=DGROUP. Listen sockets and receive buffers are pre-allocated before `_dos_keep()` since far heap `malloc()` cannot allocate new DOS memory blocks after the TSR is installed. The resident size is determined from the MCB (Memory Control Block) at PSP-1.
 
 ### mTCP Configuration
 
-Tuned for the 64 KB DGROUP constraint:
+Configuration:
 
 - 4 packet buffers
 - 8 TCP sockets (4 ports × 2: data + listen)
