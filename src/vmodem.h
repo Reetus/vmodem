@@ -254,6 +254,22 @@ void at_set_cmd_mode(int port_idx);
 unsigned char at_is_connect_pending(int port_idx);
 void at_check_ring(int port_idx);
 
+/* Non-blocking socket teardown.
+ * Sends FIN (best-effort), pushes it out, and returns the socket to the
+ * free list.  Never blocks — safe to call from any context including
+ * INT 14h with IF=0.
+ *
+ * mTCP's close() is a blocking loop that spins on PACKET_PROCESS_SINGLE
+ * until the FIN-ACK arrives.  If the remote is gone and the timer tick
+ * interrupt can't fire (IF=0 in INT 14h context, or remote simply never
+ * responds), the loop never terminates and the system hangs. */
+static inline void sock_close_fast(TcpSocket *s)
+{
+    s->closeNonblocking();    /* sends FIN, returns immediately */
+    Tcp::drivePackets();      /* push the FIN out if possible */
+    TcpSocketMgr::freeSocket(s);
+}
+
 /* vmodem.c - control commands (callable from INT 2Fh handler) */
 void cmd_listen(int port_idx, unsigned short tcp_port);
 void cmd_disconnect(int port_idx);

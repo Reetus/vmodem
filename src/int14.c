@@ -474,14 +474,7 @@ void __interrupt __far __loadds int14_real_handler(void)
             p->dtr_ignore = 0;  /* reset &D0 on disconnect */
             if (p->sock) {
                 telnet_send_text(port_idx, "\r\nSession finished.\r\n");
-                Tcp::drivePackets();
-                /* Blocking close — completes the full TCP handshake
-                 * so the socket is properly cleaned up for reuse.
-                 * This is fine in INIT context: the BBS just called
-                 * INIT and can tolerate a brief wait.  mTCP has a
-                 * 15-second timeout if the remote is unresponsive. */
-                p->sock->close();
-                TcpSocketMgr::freeSocket(p->sock);
+                sock_close_fast(p->sock);
                 p->sock = NULL;
             }
             memset(p->remoteIP, 0, 4);
@@ -508,7 +501,7 @@ void __interrupt __far __loadds int14_real_handler(void)
             unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
             p->last_tx_tick = now;
             p->last_rx_tick = now;
-            p->idle_timeout = 30;  /* default 30 second idle timeout */
+            p->idle_timeout = 0;   /* idle timeout disabled by default */
         }
         /* Save ringing state before at_init clears it.  RA calls
          * FOSSIL INIT after answering a call (F:04 post-CONNECT) —

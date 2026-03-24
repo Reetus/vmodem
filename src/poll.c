@@ -133,10 +133,7 @@ void do_mtcp_poll(void)
                 "\r\nAll lines are engaged. Please try again later.\r\n";
             dbg("[HUNT-REJECT]");
             ns->send(busy_msg, sizeof(busy_msg) - 1);
-            Tcp::drivePackets();
-            ns->close();
-            Tcp::drivePackets();
-            TcpSocketMgr::freeSocket(ns);
+            sock_close_fast(ns);
         }
     }
 
@@ -158,8 +155,7 @@ void do_mtcp_poll(void)
             ns = TcpSocketMgr::accept();
             if (ns) {
                 if (p->sock) {
-                    p->sock->close();
-                    TcpSocketMgr::freeSocket(p->sock);
+                    sock_close_fast(p->sock);
                 }
                 p->sock = ns;
                 p->mode = PORT_CONN;
@@ -238,10 +234,7 @@ void do_mtcp_poll(void)
                                 "\r\nLine is engaged. Please try again later.\r\n";
                             dbg("[BUSY-REJECT]");
                             ns->send(busy_msg, sizeof(busy_msg) - 1);
-                            Tcp::drivePackets();
-                            ns->close();
-                            Tcp::drivePackets();
-                            TcpSocketMgr::freeSocket(ns);
+                            sock_close_fast(ns);
                         }
                     }
                 } else {
@@ -281,10 +274,7 @@ void do_mtcp_poll(void)
                 p->pending_close = 0;
                 if (!silent)
                     telnet_send_text(i, "\r\nSession finished.\r\n");
-                Tcp::drivePackets();
-                p->sock->close();
-                Tcp::drivePackets();
-                TcpSocketMgr::freeSocket(p->sock);
+                sock_close_fast(p->sock);
                 p->sock = NULL;
                 memset(p->remoteIP, 0, 4);
                 p->remotePort = 0;
@@ -367,9 +357,7 @@ void do_mtcp_poll(void)
                     if (tx_idle > timeout_ticks && rx_idle > timeout_ticks) {
                         dbg("[IDLE-TIMEOUT]");
                         telnet_send_text(i, "\r\nClosing idle connection.\r\n");
-                        p->sock->close();
-                        Tcp::drivePackets();
-                        TcpSocketMgr::freeSocket(p->sock);
+                        sock_close_fast(p->sock);
                         p->sock = NULL;
                         memset(p->remoteIP, 0, 4);
                         p->remotePort = 0;
@@ -390,8 +378,7 @@ void do_mtcp_poll(void)
                     (p->sock->isClosed() ||
                     (age > 182UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
                     dbg(p->sock->isClosed() ? "[DISC-CLOSED]" : "[DISC-REMOTE]");
-                    p->sock->close();
-                    TcpSocketMgr::freeSocket(p->sock);
+                    sock_close_fast(p->sock);
                     p->sock = NULL;
                     memset(p->remoteIP, 0, 4);
                     p->remotePort = 0;
@@ -443,9 +430,7 @@ void do_mtcp_poll(void)
         /* Handle deferred close (set by MUX_SOCK_CLOSE in INT 2Fh).
          * Done here where interrupts are enabled so close() can transmit FIN. */
         if (g_state.ext_sockets[i].state == EXT_SOCK_CLOSING) {
-            es->close();
-            Tcp::drivePackets();
-            TcpSocketMgr::freeSocket(es);
+            sock_close_fast(es);
             g_state.ext_sockets[i].sock = NULL;
             g_state.ext_sockets[i].state = EXT_SOCK_FREE;
             dbg("[SOCK-CLOSE]");

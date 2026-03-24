@@ -550,6 +550,8 @@ static void test_idle_timeout(void)
     unsigned char mode;
 
     fossil_init_answer(0);
+    /* Idle timeout is disabled by default; enable it via S30 register */
+    fossil_tx_string(0, "ATS30=30\r");
     log_info("IDLE_TIMEOUT: waiting for connection...");
     write_ready_flag("IDLE_WAITING_DCD");
 
