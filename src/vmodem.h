@@ -51,6 +51,7 @@
 /* Telnet option codes */
 #define TELOPT_ECHO      0x01
 #define TELOPT_SGA       0x03   /* Suppress Go Ahead */
+#define TELOPT_TTYPE     0x18   /* Terminal Type (24) */
 #define TELOPT_NAWS      0x1F   /* Negotiate About Window Size (31) */
 
 /* Private stack for INT 8h/28h handlers.  mTCP's TCP/ARP/packet processing
@@ -108,12 +109,14 @@ typedef struct {
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
     unsigned char  neg_naws;    /* 1 = NAWS option negotiated */
+    unsigned char  neg_ttype;   /* 1 = TTYPE option negotiated */
     unsigned char  sb_opt;      /* subneg option code being received */
     unsigned char  sb_buf[8];   /* subneg data accumulator */
     unsigned char  sb_len;      /* bytes accumulated in sb_buf */
-    unsigned char  _pad_naws;   /* alignment pad */
     unsigned short naws_cols;   /* terminal width (0 = unknown) */
     unsigned short naws_rows;   /* terminal height (0 = unknown) */
+    char           ttype[41];   /* terminal type string from client */
+    unsigned char  _pad_ttype;  /* alignment pad */
     unsigned char  pending_close;/* 1 = close socket on next poll cycle */
     unsigned char  dtr_ignore;  /* 1 = ignore DTR drops (&D0 mode) */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */

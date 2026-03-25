@@ -591,6 +591,36 @@ void __interrupt __far __loadds int2f_handler(void)
         break;
     }
 
+    case MUX_PORT_TTYPE:
+    {
+        /* Copy terminal type string for a COM port to caller's buffer.
+         * CL = port index (0-3), DX = buffer size, ES:BX -> destination.
+         * Returns AX = string length (0 if not available). */
+        unsigned char port_idx;
+        unsigned char __far *dst;
+        unsigned short bufsz;
+        unsigned short len;
+
+        port_idx = (unsigned char)(orig_cx & 0xFF);
+        dst = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        bufsz = (unsigned short)orig_dx;
+        len = 0;
+
+        if (port_idx < MAX_PORTS && bufsz > 0) {
+            const char *src = g_state.ports[port_idx].ttype;
+            while (src[len] && len < bufsz - 1) {
+                dst[len] = src[len];
+                len++;
+            }
+            dst[len] = '\0';
+        }
+        __asm {
+            mov  ax, len
+            mov  [bp+22], ax
+        }
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh

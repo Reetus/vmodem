@@ -1316,6 +1316,62 @@ static void test_naws_query(void)
     fossil_deinit(0);
 }
 
+static void test_ttype_query(void)
+{
+    /* Init FOSSIL, wait for connection (Python sends TTYPE),
+     * then query TTYPE via MUX_PORT_TTYPE and report results. */
+    union REGS r;
+    struct SREGS sr;
+    char ttype_buf[42];
+
+    fossil_init_answer(0);
+    log_info("TTYPE_QUERY: waiting for connection...");
+    write_ready_flag("TTYPE_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 60)) {
+        log_result("TTYPE_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("TTYPE_DCD", 1, "(connected)");
+
+    /* Give VMODEM time to complete IAC negotiation + receive TTYPE subneg */
+    {
+        unsigned long deadline = get_tick() + 36;  /* ~2 seconds */
+        while (get_tick() < deadline)
+            dos_idle();
+    }
+
+    /* Query TTYPE via MUX_PORT_TTYPE (0x1A) */
+    memset(ttype_buf, 0, sizeof(ttype_buf));
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_PORT_TTYPE;
+    r.h.cl = 0;  /* COM1 */
+    r.x.dx = sizeof(ttype_buf);
+    sr.es = FP_SEG(ttype_buf);
+    r.x.bx = FP_OFF(ttype_buf);
+    int86x(0x2F, &r, &r, &sr);
+
+    {
+        char buf[80];
+        sprintf(buf, "(ttype=\"%s\" len=%u)", ttype_buf, r.x.ax);
+        log_result("TTYPE_NONZERO", ttype_buf[0] != '\0', buf);
+        log_result("TTYPE_VALUE", strcmp(ttype_buf, "ANSI") == 0, buf);
+    }
+
+    /* Signal Python to disconnect */
+    write_ready_flag("TTYPE_DONE");
+
+    if (wait_for_no_dcd(0, 30))
+        log_result("TTYPE_DISC", 1, "(disconnected)");
+    else
+        log_result("TTYPE_DISC", 0, "(still connected)");
+
+    fossil_deinit(0);
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char *argv[])
@@ -1404,6 +1460,8 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(upper, "NAWS_QUERY") == 0)
             test_naws_query();
+        else if (strcmp(upper, "TTYPE_QUERY") == 0)
+            test_ttype_query();
         else {
             printf("Unknown test: %s\n", upper);
             fprintf(logfile, "FAIL: UNKNOWN_TEST %s\n", upper);

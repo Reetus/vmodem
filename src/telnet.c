@@ -63,7 +63,7 @@ void telnet_send_text(int port_idx, const char *msg)
 void telnet_on_connect(int port_idx)
 {
     PortState *p = &g_state.ports[port_idx];
-    unsigned char neg[12];
+    unsigned char neg[15];
 
     /* Reset parser */
     p->iac_state = IAC_NORMAL;
@@ -71,19 +71,22 @@ void telnet_on_connect(int port_idx)
     p->neg_echo  = 0;
     p->neg_sga   = 0;
     p->neg_naws  = 0;
+    p->neg_ttype = 0;
     p->sb_opt    = 0;
     p->sb_len    = 0;
     p->naws_cols = 0;
     p->naws_rows = 0;
+    p->ttype[0]  = '\0';
 
     /* Build negotiation sequence:
-     *   WILL ECHO, WILL SGA, DO SGA, DO NAWS */
+     *   WILL ECHO, WILL SGA, DO SGA, DO NAWS, DO TTYPE */
     neg[0] = TEL_IAC;  neg[1] = TEL_WILL; neg[2] = TELOPT_ECHO;
     neg[3] = TEL_IAC;  neg[4] = TEL_WILL; neg[5] = TELOPT_SGA;
     neg[6] = TEL_IAC;  neg[7] = TEL_DO;   neg[8] = TELOPT_SGA;
     neg[9] = TEL_IAC;  neg[10] = TEL_DO;  neg[11] = TELOPT_NAWS;
+    neg[12] = TEL_IAC; neg[13] = TEL_DO;  neg[14] = TELOPT_TTYPE;
 
-    telnet_send_raw(p, neg, 12);
+    telnet_send_raw(p, neg, 15);
 }
 
 /* -----------------------------------------------------------------------
@@ -158,7 +161,17 @@ static void telnet_handle_option(PortState *p,
         } else if (opt == TELOPT_NAWS && !p->neg_naws) {
             p->neg_naws = 1;
             telnet_send_response(p, TEL_DO, opt);
-        } else if (opt != TELOPT_SGA && opt != TELOPT_NAWS) {
+        } else if (opt == TELOPT_TTYPE && !p->neg_ttype) {
+            p->neg_ttype = 1;
+            /* Request terminal type: IAC SB TTYPE SEND(1) IAC SE */
+            {
+                static unsigned char ttype_req[6];
+                ttype_req[0] = TEL_IAC;  ttype_req[1] = TEL_SB;
+                ttype_req[2] = TELOPT_TTYPE; ttype_req[3] = 0x01; /* SEND */
+                ttype_req[4] = TEL_IAC;  ttype_req[5] = TEL_SE;
+                telnet_send_raw(p, ttype_req, 6);
+            }
+        } else if (opt != TELOPT_SGA && opt != TELOPT_NAWS && opt != TELOPT_TTYPE) {
             telnet_send_response(p, TEL_DONT, opt);
         }
         break;
@@ -233,6 +246,10 @@ int telnet_filter(PortState *p, unsigned char b)
         /* First byte of subneg is the option code */
         if (p->sb_len == 0) {
             p->sb_opt = b;
+        } else if (p->sb_opt == TELOPT_TTYPE && p->sb_len >= 2) {
+            /* TTYPE: sb_len=1 is IS/SEND byte, sb_len=2+ is type string */
+            unsigned char ti = (unsigned char)(p->sb_len - 2);
+            if (ti < 40) p->ttype[ti] = (char)b;
         } else if (p->sb_len <= 8) {
             /* Accumulate data bytes (sb_buf[0] is first data byte after opt) */
             p->sb_buf[p->sb_len - 1] = b;
@@ -243,7 +260,15 @@ int telnet_filter(PortState *p, unsigned char b)
     case IAC_SB_IAC:
         if (b == TEL_SE) {
             /* Subnegotiation complete — process it */
-            if (p->sb_opt == TELOPT_NAWS && p->sb_len >= 5) {
+            if (p->sb_opt == TELOPT_TTYPE && p->sb_len > 2) {
+                /* TTYPE IS <string> — null-terminate */
+                unsigned char tlen = (unsigned char)(p->sb_len - 2);
+                if (tlen > 40) tlen = 40;
+                p->ttype[tlen] = '\0';
+                dbg("[TTYPE ");
+                dbg(p->ttype);
+                dbg("]");
+            } else if (p->sb_opt == TELOPT_NAWS && p->sb_len >= 5) {
                 /* NAWS format: SB 31 <cols_hi> <cols_lo> <rows_hi> <rows_lo> SE
                  * sb_buf[0]=cols_hi, [1]=cols_lo, [2]=rows_hi, [3]=rows_lo */
                 p->naws_cols = ((unsigned short)p->sb_buf[0] << 8) | p->sb_buf[1];

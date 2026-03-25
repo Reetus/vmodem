@@ -385,8 +385,10 @@ int recv(int sockfd, void *buf, int len, int flags)
     /* Check for EOF / remote close */
     {
         int st = mux_sock_status(h);
-        if (st == EXT_SOCK_REMOTE_CLOSED || st == EXT_SOCK_ERROR)
-            return 0;      /* EOF */
+        if (st == EXT_SOCK_REMOTE_CLOSED || st == EXT_SOCK_ERROR) {
+            vsock_errno = 1;
+            return -1;     /* remote closed */
+        }
     }
 
     return 0;   /* no data available */
