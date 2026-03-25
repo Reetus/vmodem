@@ -568,6 +568,29 @@ void __interrupt __far __loadds int2f_handler(void)
         break;
     }
 
+    case MUX_PORT_NAWS:
+    {
+        /* Return NAWS cols/rows for a COM port.
+         * CL = port index (0-3).  Returns DX = cols, SI = rows.
+         * If port invalid or NAWS not negotiated, returns 0,0. */
+        unsigned char port_idx;
+        unsigned short cols, rows;
+        port_idx = (unsigned char)(orig_cx & 0xFF);
+        cols = 0;
+        rows = 0;
+        if (port_idx < MAX_PORTS) {
+            cols = g_state.ports[port_idx].naws_cols;
+            rows = g_state.ports[port_idx].naws_rows;
+        }
+        __asm {
+            mov  ax, cols
+            mov  [bp+18], ax
+            mov  ax, rows
+            mov  [bp+10], ax
+        }
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh

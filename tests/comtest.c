@@ -1261,6 +1261,61 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
         write_ready_flag("RELAY_FAIL");
 }
 
+/* ---- NAWS query test ---- */
+
+static void test_naws_query(void)
+{
+    /* Init FOSSIL, wait for connection (Python sends NAWS),
+     * then query NAWS via MUX_PORT_NAWS and report results. */
+    union REGS r;
+    unsigned short cols, rows;
+
+    fossil_init_answer(0);
+    log_info("NAWS_QUERY: waiting for connection...");
+    write_ready_flag("NAWS_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 60)) {
+        log_result("NAWS_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("NAWS_DCD", 1, "(connected)");
+
+    /* Give VMODEM time to complete IAC negotiation + receive NAWS subneg */
+    {
+        unsigned long deadline = get_tick() + 36;  /* ~2 seconds */
+        while (get_tick() < deadline)
+            dos_idle();
+    }
+
+    /* Query NAWS via MUX_PORT_NAWS (0x19) */
+    memset(&r, 0, sizeof(r));
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_PORT_NAWS;
+    r.h.cl = 0;  /* COM1 */
+    int86(0x2F, &r, &r);
+    cols = r.x.dx;
+    rows = r.x.si;
+
+    {
+        char buf[80];
+        sprintf(buf, "(cols=%u rows=%u)", cols, rows);
+        log_result("NAWS_NONZERO", cols > 0 && rows > 0, buf);
+        log_result("NAWS_COLS", cols == 132, buf);
+        log_result("NAWS_ROWS", rows == 37, buf);
+    }
+
+    /* Signal Python to disconnect */
+    write_ready_flag("NAWS_DONE");
+
+    if (wait_for_no_dcd(0, 30))
+        log_result("NAWS_DISC", 1, "(disconnected)");
+    else
+        log_result("NAWS_DISC", 0, "(still connected)");
+
+    fossil_deinit(0);
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char *argv[])
@@ -1347,6 +1402,8 @@ int main(int argc, char *argv[])
             const char *host = argc > 2 ? argv[2] : "one.one.one.one";
             test_dns_resolve(host);
         }
+        else if (strcmp(upper, "NAWS_QUERY") == 0)
+            test_naws_query();
         else {
             printf("Unknown test: %s\n", upper);
             fprintf(logfile, "FAIL: UNKNOWN_TEST %s\n", upper);

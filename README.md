@@ -13,7 +13,7 @@ VMODEM hooks INT 14h to present a standard FOSSIL driver interface (the same API
 - **FOSSIL-compatible** — drop-in replacement for a physical modem + FOSSIL driver
 - **Multi-port** — supports COM1–COM4 simultaneously
 - **Hunt groups** — multiple COM ports share a single TCP listen port; incoming connections are dispatched to the first free port (like a modem hunt group)
-- **Telnet IAC** — handles telnet protocol negotiation (WILL/WONT/DO/DONT, IAC escaping, NOP keepalives)
+- **Telnet IAC** — handles telnet protocol negotiation (WILL/WONT/DO/DONT, IAC escaping, NAWS window size, NOP keepalives)
 - **AT command emulation** — RING, auto-answer (S0 register), CONNECT/NO CARRIER responses
 - **Door support** — AT&D0 ignores DTR drops so BBS door programs can launch without losing the connection
 - **Outgoing TCP** — BSD socket API (`vsocket.lib`) lets DOS programs make outgoing TCP connections through the TSR
@@ -205,6 +205,8 @@ python3 test_vmodem.py -l
 | `test_hunt_ring_timeout` | Hunt mode /E: ring timeout returns ports to LISTEN |
 | `test_tcp_out` | Outgoing TCP connection via MUX socket API |
 | `test_relay` | Bidirectional relay: FOSSIL incoming ↔ MUX socket outgoing |
+| `test_single_busy` | Single-port listen rejects second connection while busy |
+| `test_naws` | NAWS window size negotiation: telnet client sends 132×37, COMTEST verifies via MUX |
 
 Tests run inside DOSBox-X with slirp networking. The Python harness launches DOSBox-X, waits for VMODEM to start listening, connects via TCP, and communicates with `COMTEST.EXE` running inside the VM. Results are read from `COMTEST.LOG` written to a shared directory.
 
@@ -282,6 +284,7 @@ Runtime control and external socket API. Subcommands 00h–07h control the TSR; 
 | 16h | Sock result | Returns AX=last operation result |
 | 17h | DNS resolve | ES:BX→hostname; initiates async DNS query |
 | 18h | DNS result | ES:BX→4-byte IP buf; returns AL=state |
+| 19h | Port NAWS | CL=port(0–3); returns DX=cols, SI=rows |
 | FFh | Unload | Restore vectors, free TSR memory |
 
 ### Port State Machine

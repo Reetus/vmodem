@@ -38,6 +38,7 @@
 #define MUX_SOCK_RESULT  0x16   /* ret AX=last mux_sock_result            */
 #define MUX_SOCK_RESOLVE 0x17   /* ES:BX->hostname; initiates DNS query   */
 #define MUX_SOCK_RESOLVE_RESULT 0x18  /* ES:BX->4-byte IP buf; ret AL=state */
+#define MUX_PORT_NAWS    0x19   /* CL=port(0-3); ret DX=cols, SI=rows    */
 
 #define MAX_EXT_SOCKETS  4
 
