@@ -37,6 +37,7 @@
 #include "vmodem.h"
 #include "tcp.h"
 #include "tcpsockm.h"
+#include "packet.h"
 
 /* Saved original INT 14h vector — set during TSR install in vmodem.c */
 void (__interrupt __far *old_int14)(void) = NULL;
@@ -57,6 +58,19 @@ typedef struct {
 
 static TxRing g_tx[MAX_PORTS];
 
+/* Pending TX buffer — holds unsent bytes from partial sock->send() calls.
+ * When mTCP's xmit buffers are full, send() returns less than requested.
+ * We keep the remainder here and retry on the next fossil_flush_tx call.
+ * Without this, ZMODEM headers and data get silently truncated.
+ *
+ * Single shared buffer (not per-port) — fossil_flush_tx is called
+ * sequentially per port from the poll loop, never concurrently.
+ * pend_port tracks which port owns the pending data (-1 = none). */
+static unsigned char g_tx_pending[TX_RING_SIZE * 2];
+static unsigned short g_tx_pend_len;
+static unsigned short g_tx_pend_off;
+static signed char g_tx_pend_port;  /* port owning pending data, -1=none */
+
 /* Per-port FOSSIL state */
 static unsigned char g_fossil_init[MAX_PORTS];  /* 1 = FOSSIL init'd on this port */
 static unsigned char g_flow_ctrl[MAX_PORTS];    /* flow control flags */
@@ -68,6 +82,12 @@ static unsigned char g_purge_seen[MAX_PORTS];  /* set when AH=09h called while c
 /* Flag: set to 1 during INT 14h poll context — DOS I/O is safe because
  * this is a software interrupt from user code, not a hardware IRQ. */
 unsigned char g_int14_safe = 0;
+
+/* Flag: set to 1 when first AH=18h (block read) is called.
+ * Activates byte-level protocol diagnostics — skips login phase. */
+unsigned char g_block_mode = 0;
+unsigned short g_diag_session = 0;  /* increments on each ZMODEM session start */
+
 
 /* FOSSIL driver info string */
 static char fossil_id_str[] = "VMODEM FOSSIL driver " VMODEM_VER_STR "\0";
@@ -129,11 +149,17 @@ static unsigned short fossil_status(int port_idx)
     unsigned char lsr = 0;
     unsigned char msr = 0;
 
-    /* TX status */
-    if (g_tx[port_idx].count < TX_RING_SIZE)
-        lsr |= 0x20;  /* THRE - room in output buffer */
-    if (g_tx[port_idx].count == 0)
-        lsr |= 0x40;  /* TSRE - output buffer empty */
+    /* TX status — also consider pending unsent bytes from partial sends.
+     * If TCP xmit buffers are full, report TX busy so the BBS/protocol
+     * backs off instead of overflowing the TX ring. */
+    {
+        unsigned char has_pending = (g_tx_pend_port == (signed char)port_idx &&
+                                     g_tx_pend_len > g_tx_pend_off);
+        if (g_tx[port_idx].count < TX_RING_SIZE && !has_pending)
+            lsr |= 0x20;  /* THRE - room in output buffer */
+        if (g_tx[port_idx].count == 0 && !has_pending)
+            lsr |= 0x40;  /* TSRE - output buffer empty */
+    }
 
     /* RX status */
     if (ring_count(&p->rx) > 0)
@@ -207,8 +233,14 @@ int fossil_is_init(int port_idx)
 
 void fossil_clear_tx(int port_idx)
 {
-    if (port_idx >= 0 && port_idx < MAX_PORTS)
+    if (port_idx >= 0 && port_idx < MAX_PORTS) {
         txring_init(&g_tx[port_idx]);
+        if (g_tx_pend_port == (signed char)port_idx) {
+            g_tx_pend_len = 0;
+            g_tx_pend_off = 0;
+            g_tx_pend_port = -1;
+        }
+    }
 }
 
 int fossil_flush_tx(int port_idx)
@@ -229,26 +261,54 @@ int fossil_flush_tx(int port_idx)
     if (p->sock == NULL || p->sock->isClosed())
         return 0;
 
-    /* Batch bytes into a static buffer and send in one chunk.
-     * IAC (0xFF) bytes get doubled for telnet escaping, so the
-     * output buffer needs to be 2x the ring size in the worst case. */
+    /* First, try to send any leftover bytes from a previous partial send */
+    if (g_tx_pend_port == (signed char)port_idx &&
+        g_tx_pend_len > g_tx_pend_off) {
+        int16_t rc = p->sock->send(
+            g_tx_pending + g_tx_pend_off,
+            g_tx_pend_len - g_tx_pend_off);
+        if (rc > 0)
+            g_tx_pend_off += (unsigned short)rc;
+        if (g_tx_pend_len > g_tx_pend_off)
+            return 0;  /* still can't send — xmit buffers full, try later */
+        g_tx_pend_len = 0;
+        g_tx_pend_off = 0;
+        g_tx_pend_port = -1;
+    }
+
+    /* Batch bytes from TX ring into pending buffer with IAC escaping.
+     * Always escape 0xFF as IAC IAC — even in BINARY mode.
+     * SyncTERM and many clients still process inbound IAC in BINARY
+     * mode (asymmetric: they send raw but expect IAC-escaped input).
+     * Without escaping, 0xFF in BBS output corrupts the data stream
+     * on the SyncTERM side. */
     {
-        static unsigned char outbuf[TX_RING_SIZE * 2];
         unsigned short outpos = 0;
 
         while (t->count > 0) {
             b = txring_get(t);
             if (b < 0) break;
             if ((unsigned char)b == 0xFF) {
-                outbuf[outpos++] = 0xFF;
-                outbuf[outpos++] = 0xFF;
+                g_tx_pending[outpos++] = 0xFF;
+                g_tx_pending[outpos++] = 0xFF;
             } else {
-                outbuf[outpos++] = (unsigned char)b;
+                g_tx_pending[outpos++] = (unsigned char)b;
             }
             sent++;
         }
-        if (outpos > 0)
-            p->sock->send(outbuf, outpos);
+        if (outpos > 0) {
+            int16_t rc = p->sock->send(g_tx_pending, outpos);
+            if (rc < 0) rc = 0;
+            g_tx_pend_off = (unsigned short)rc;
+            g_tx_pend_len = outpos;
+            g_tx_pend_port = (signed char)port_idx;
+            /* If fully sent, reset for next call */
+            if (g_tx_pend_off >= g_tx_pend_len) {
+                g_tx_pend_off = 0;
+                g_tx_pend_len = 0;
+                g_tx_pend_port = -1;
+            }
+        }
     }
     return sent;
 }
@@ -361,13 +421,16 @@ void __interrupt __far __loadds int14_real_handler(void)
          * consumed (command mode), 0 if we should send to TCP. */
         at_rc = at_input(port_idx, byte_to_send);
         if (at_rc == 0) {
-            /* Data mode — send to TCP via TX ring */
+            /* Data mode — send to TCP via TX ring.
+             * If the ring is full, flush pending data first.
+             * Do NOT bypass via telnet_send_byte — that would send
+             * bytes out of order if pending data exists. */
             if (p->mode == PORT_CONN && p->sock != NULL && !at_is_ringing(port_idx)) {
                 if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
                     fossil_flush_tx(port_idx);
-                    if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
-                        telnet_send_byte(p, byte_to_send);
-                    }
+                    txring_put(&g_tx[port_idx], byte_to_send);
+                    /* If still full, byte is lost — THRE status will
+                     * tell caller to back off on next AH=03h check */
                 }
             }
         }
@@ -384,26 +447,29 @@ void __interrupt __far __loadds int14_real_handler(void)
     case 0x02:
     {
         int b;
+
+        /* Always drive mTCP on reads to keep packet pipeline flowing.
+         * Without this, burst TCP data overflows packet buffers because
+         * packets only get processed when the ring happens to be empty.
+         * ZMODEM and other binary protocols send sustained bursts that
+         * arrive faster than the 18.2 Hz timer tick can drain them. */
+        if (!g_state.busy) {
+            g_state.busy = 1;
+            g_int14_safe = 1;
+            _enable();
+            poll_on_priv_stack();
+            _disable();
+            g_int14_safe = 0;
+            g_state.busy = 0;
+        }
+
+        /* AH=02h means the BBS is back in single-byte mode (not ZMODEM).
+         * Clear g_block_mode so the next AH=18h triggers a session reset. */
+        g_block_mode = 0;
+
         b = ring_get(&p->rx);
         if (b < 0) {
-            /* No data — drive mTCP so we can receive packets and
-             * accept connections.  INT 14h is a software interrupt
-             * from user code, so this is safe (not hardware IRQ). */
-            if (!g_state.busy) {
-                g_state.busy = 1;
-                g_int14_safe = 1;
-                _enable();
-                poll_on_priv_stack();
-                _disable();
-                g_int14_safe = 0;
-                g_state.busy = 0;
-                b = ring_get(&p->rx);
-            }
-            if (b < 0) {
-                ret_ax = 0x8000;  /* timeout — no data */
-            } else {
-                ret_ax = (unsigned short)b;
-            }
+            ret_ax = 0x8000;  /* timeout — no data */
         } else {
             ret_ax = (unsigned short)b;  /* AH=00h, AL=byte */
         }
@@ -458,7 +524,7 @@ void __interrupt __far __loadds int14_real_handler(void)
     {
         /* Reset buffers */
         ring_init(&p->rx);
-        txring_init(&g_tx[port_idx]);
+        fossil_clear_tx(port_idx);  /* clears TX ring AND pending send buffer */
 
         /* If an old connection is pending close (from DEINIT, DCD-drop,
          * or ATZ), close it NOW rather than deferring to the poll cycle.
@@ -529,7 +595,7 @@ void __interrupt __far __loadds int14_real_handler(void)
             if (hgi < MAX_HUNT_GROUPS && g_state.huntGroups[hgi].active &&
                 g_state.huntGroups[hgi].listenSock == NULL) {
                 TcpSocket *ls = TcpSocketMgr::getSocket();
-                if (ls && ls->listen(g_state.huntGroups[hgi].tcpPort, 2048) == 0) {
+                if (ls && ls->listen(g_state.huntGroups[hgi].tcpPort, 16384) == 0) {
                     g_state.huntGroups[hgi].listenSock = ls;
                     dbg("[HUNT-LISTEN-START]");
                 } else {
@@ -543,7 +609,7 @@ void __interrupt __far __loadds int14_real_handler(void)
             if (p->listenSock == NULL) {
                 /* Per-port listen (standalone) — first init */
                 TcpSocket *ls = TcpSocketMgr::getSocket();
-                if (ls && ls->listen(p->localPort, 2048) == 0) {
+                if (ls && ls->listen(p->localPort, 16384) == 0) {
                     p->listenSock = ls;
                     p->mode = PORT_LISTEN;
                     dbg("[LISTEN-START]");
@@ -665,7 +731,7 @@ void __interrupt __far __loadds int14_real_handler(void)
      * Discard any pending output.
      * ------------------------------------------------------------------ */
     case 0x09:
-        txring_init(&g_tx[port_idx]);
+        fossil_clear_tx(port_idx);  /* clears TX ring AND pending send buffer */
         /* Only set purge_seen if not already in DCD-dropped state (>=3)
          * and the connection has been up for at least ~10 seconds.
          * BBS calls AH=09h during normal post-answer setup — without
@@ -903,11 +969,103 @@ void __interrupt __far __loadds int14_real_handler(void)
         unsigned short count = 0;
         int b;
 
+        if (!g_block_mode) {
+            /* New ZMODEM session — bump session counter so all
+             * diagnostic blocks reset their per-session limits. */
+            g_block_mode = 1;
+            g_diag_session++;
+            dbg("[ZMODEM-START]");
+        }
+
+        /* Drive mTCP on block reads.  When the ring is empty, keep
+         * polling for up to 1 BIOS tick (~55ms) so TCP inter-segment
+         * gaps don't exhaust the BBS's ZMODEM byte-level timeout.
+         * Each poll cycle processes packets AND enables interrupts,
+         * allowing the packet driver to deliver incoming frames. */
+        if (!g_state.busy) {
+            g_state.busy = 1;
+            g_int14_safe = 1;
+            _enable();
+            poll_on_priv_stack();
+            if (ring_count(&p->rx) == 0
+                && p->sock && !p->sock->isClosed()) {
+                /* Ring still empty — spin-poll for up to 2 ticks (~110ms).
+                 * ZMODEM timeout is ~10s, so 110ms is safe and gives TCP
+                 * time to deliver segments across SLIRP's proxy chain. */
+                unsigned long start_tick =
+                    *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                while (ring_count(&p->rx) == 0) {
+                    poll_on_priv_stack();
+                    if ((*(volatile unsigned long __far *)MK_FP(0x0040, 0x006C)
+                        - start_tick) >= 2UL)
+                        break;  /* 2 ticks elapsed */
+                }
+            }
+            _disable();
+            g_int14_safe = 0;
+            g_state.busy = 0;
+        } else {
+            static unsigned short busy_skip = 0;
+            static unsigned short busy_sess = 0;
+            if (busy_sess != g_diag_session) { busy_sess = g_diag_session; busy_skip = 0; }
+            if (busy_skip < 4) { busy_skip++; dbg("[R18-BUSY]"); }
+        }
+
         while (count < max_chars) {
             b = ring_get(&p->rx);
             if (b < 0)
                 break;
             ubuf[count++] = (unsigned char)b;
+        }
+        /* Debug: log block read results.
+         * E18 counter resets when data flows again (non-empty read),
+         * so each stall phase gets its own diagnostic window. */
+        {
+            static unsigned short r18_log_count = 0;
+            static unsigned short empty_log = 0;
+            static unsigned short r18_sess = 0;
+            if (r18_sess != g_diag_session) {
+                r18_sess = g_diag_session;
+                r18_log_count = 0;
+                empty_log = 0;
+            }
+            if (count > 0) {
+                /* Data flowing — reset empty counter for next stall */
+                empty_log = 0;
+                if (r18_log_count < 40) {
+                    r18_log_count++;
+                    dbg_hex("[R18:", (unsigned char)(count & 0xFF));
+                    if (count >= 1) dbg_hex("", ubuf[0]);
+                    if (count >= 2) dbg_hex("", ubuf[1]);
+                    if (count >= 3) dbg_hex("", ubuf[2]);
+                    if (count >= 4) dbg_hex("", ubuf[3]);
+                    if (count >= 5) dbg_hex("", ubuf[4]);
+                    if (count >= 6) dbg_hex("", ubuf[5]);
+                    dbg("]");
+                }
+            } else if (g_block_mode) {
+                if (empty_log < 10) {
+                    empty_log++;
+                    dbg("[E18:");
+                    if (p->sock) {
+                        dbg_hex("S", (unsigned char)p->sock->state);
+                        dbg_hex("W", p->sock->recvDataWaiting()
+                                      ? (unsigned char)1 : (unsigned char)0);
+                        /* TCP recv buffer usage + window restriction state */
+                        dbg_hex("B", (unsigned char)((p->sock->rcvBufEntries >> 8) & 0xFF));
+                        dbg_hex("Q", (unsigned char)p->sock->consecutiveSeqErrs);
+                        dbg_hex("M", p->sock->reportSmallWindow
+                                      ? (unsigned char)1 : (unsigned char)0);
+                    } else {
+                        dbg("NULL");
+                    }
+                    dbg_hex("R", (unsigned char)(ring_count(&p->rx) & 0xFF));
+                    dbg_hex("D", (unsigned char)(Packets_dropped & 0xFF));
+                    dbg_hex("F", (unsigned char)Buffer_lowFreeCount);
+                    dbg_hex("E", (unsigned char)(Tcp::Packets_SeqOrAckError & 0xFF));
+                    dbg("]");
+                }
+            }
         }
         ret_ax = count;
         break;
@@ -924,15 +1082,40 @@ void __interrupt __far __loadds int14_real_handler(void)
         unsigned char __far *ubuf = (unsigned char __far *)MK_FP(orig_es, orig_di);
         unsigned short count = 0;
 
-        while (count < max_chars) {
-            if (at_input(port_idx, ubuf[count])) {
-                count++;  /* consumed by AT parser */
-            } else if (p->mode == PORT_CONN && p->sock != NULL) {
-                if (txring_put(&g_tx[port_idx], ubuf[count]) < 0)
-                    break;  /* TX buffer full */
+        /* Block writes are bulk data — skip AT command / +++ escape
+         * detection.  Only single-byte AH=01h/0Bh should trigger +++.
+         * Running at_input on every byte of a ZMODEM block silently
+         * eats '+' (0x2B) bytes, corrupting the data stream. */
+        if (p->mode == PORT_CONN && p->sock != NULL) {
+            while (count < max_chars) {
+                if (txring_put(&g_tx[port_idx], ubuf[count]) < 0) {
+                    /* TX ring full — flush to TCP and retry */
+                    fossil_flush_tx(port_idx);
+                    if (txring_put(&g_tx[port_idx], ubuf[count]) < 0)
+                        break;  /* still full — stop */
+                }
                 count++;
-            } else {
-                break;
+            }
+        }
+        /* Flush written data to TCP immediately — don't wait for
+         * the next poll cycle.  ZMODEM response timing is critical. */
+        if (count > 0)
+            fossil_flush_tx(port_idx);
+        /* Debug: log block write with first 6 data bytes (block mode only) */
+        if (g_block_mode) {
+            static unsigned short w19_log_count = 0;
+            static unsigned short w19_sess = 0;
+            if (w19_sess != g_diag_session) { w19_sess = g_diag_session; w19_log_count = 0; }
+            if (w19_log_count < 30) {
+                w19_log_count++;
+                dbg_hex("[TX:", (unsigned char)(count & 0xFF));
+                if (count >= 1) dbg_hex("", ubuf[0]);
+                if (count >= 2) dbg_hex("", ubuf[1]);
+                if (count >= 3) dbg_hex("", ubuf[2]);
+                if (count >= 4) dbg_hex("", ubuf[3]);
+                if (count >= 5) dbg_hex("", ubuf[4]);
+                if (count >= 6) dbg_hex("", ubuf[5]);
+                dbg("]");
             }
         }
         ret_ax = count;

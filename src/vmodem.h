@@ -27,7 +27,7 @@
 
 #include "vmodem_mux.h"          /* StatusBlock, MUX_*, MAX_PORTS, etc. */
 
-#define RING_SIZE        512          /* rx ring buffer size (power-of-2!) */
+#define RING_SIZE        4096         /* rx ring buffer size (power-of-2!) */
 
 /* Maximum hunt groups (shared listen across multiple COM ports) */
 #define MAX_HUNT_GROUPS  2
@@ -49,6 +49,7 @@
 #define TEL_SE           0xF0   /* subnegotiation end   */
 
 /* Telnet option codes */
+#define TELOPT_BINARY    0x00   /* Binary Transmission (RFC 856) */
 #define TELOPT_ECHO      0x01
 #define TELOPT_SGA       0x03   /* Suppress Go Ahead */
 #define TELOPT_TTYPE     0x18   /* Terminal Type (24) */
@@ -108,17 +109,21 @@ typedef struct {
     unsigned char  iac_cmd;     /* the command byte we saw (WILL/WONT/DO/DONT) */
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
+    unsigned char  neg_binary;  /* 1 = BINARY option negotiated */
     unsigned char  neg_naws;    /* 1 = NAWS option negotiated */
     unsigned char  neg_ttype;   /* 1 = TTYPE option negotiated */
     unsigned char  sb_opt;      /* subneg option code being received */
     unsigned char  sb_buf[8];   /* subneg data accumulator */
     unsigned char  sb_len;      /* bytes accumulated in sb_buf */
+    unsigned char  _pad_sb;     /* alignment pad for naws_cols */
     unsigned short naws_cols;   /* terminal width (0 = unknown) */
     unsigned short naws_rows;   /* terminal height (0 = unknown) */
     char           ttype[41];   /* terminal type string from client */
-    unsigned char  _pad_ttype;  /* alignment pad */
+    unsigned char  iac_has_pending; /* 1 = iac_pending holds a byte to return */
+    unsigned char  iac_pending;    /* buffered byte from unescaped 0xFF in BINARY mode */
     unsigned char  pending_close;/* 1 = close socket on next poll cycle */
     unsigned char  dtr_ignore;  /* 1 = ignore DTR drops (&D0 mode) */
+    unsigned char  _pad_align;  /* alignment pad for conn_tick */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
     unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */
@@ -244,6 +249,8 @@ extern "C" {
     void __interrupt __far __loadds int14_real_handler(void);  /* FOSSIL INT 14h handler */
 }
 int fossil_is_init(int port_idx); /* 1 if AH=04h was called, 0 after AH=05h */
+extern unsigned char g_block_mode; /* 1 after first AH=18h block read */
+extern unsigned short g_diag_session; /* increments on each ZMODEM session */
 int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
 void fossil_clear_tx(int port_idx); /* discard any buffered TX data */
 

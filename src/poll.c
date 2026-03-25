@@ -66,11 +66,9 @@ void do_mtcp_poll(void)
 
     g_state.poll_phase = 1;  /* packet processing */
     /* Step 1: Drive the mTCP network stack.
-     * Process up to 8 packets per poll cycle (matches PACKET_BUFFERS).
-     * With real NIC hardware, multiple packets accumulate between polls. */
+     * Process all pending packets from the packet driver ring buffer. */
     {
-        int pkt_loops = 8;
-        while (pkt_loops-- > 0 && Buffer_first != Buffer_next) {
+        while (Buffer_first != Buffer_next) {
             g_state.pkt_count++;
             PACKET_PROCESS_SINGLE;
         }
@@ -186,7 +184,7 @@ void do_mtcp_poll(void)
 
         case PORT_CONN:
         {
-            unsigned char tmp[64];
+            unsigned char tmp[256];
             int16_t n;
 
             if (p->sock == NULL) {
@@ -300,8 +298,16 @@ void do_mtcp_poll(void)
             /* Only deliver TCP data to the RX ring after the call is
              * answered.  While ringing or during connect handshake,
              * discard application data but still process telnet IAC
-             * negotiation so the connection stays healthy. */
+             * negotiation so the connection stays healthy.
+             *
+             */
             while (p->sock->recvDataWaiting()) {
+                /* Stop reading TCP if ring buffer is nearly full.
+                 * This applies back-pressure via TCP flow control,
+                 * preventing silent byte drops that corrupt ZMODEM
+                 * and other binary protocols. */
+                if (ring_count(&p->rx) > (int)(RING_SIZE - sizeof(tmp)))
+                    break;
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
                     int j;
@@ -311,17 +317,83 @@ void do_mtcp_poll(void)
                          * but drop the application bytes */
                         for (j = 0; j < n; j++)
                             telnet_filter(p, tmp[j]);
+                        {
+                            static unsigned short ring_drop = 0;
+                            if (ring_drop < 4) {
+                                ring_drop++;
+                                dbg_hex("[RING-DROP:", (unsigned char)(n & 0xFF));
+                                dbg("]");
+                            }
+                        }
                     } else {
+                        /* Always run through telnet_filter — even in
+                         * BINARY mode.  SyncTERM (and many clients)
+                         * IAC-escape 0xFF outbound (FF FF → FF), so
+                         * the filter must collapse these.  The filter
+                         * also handles truly unescaped 0xFF via the
+                         * iac_pending mechanism when neg_binary=1. */
                         for (j = 0; j < n; j++) {
                             int b = telnet_filter(p, tmp[j]);
                             if (b >= 0)
                                 ring_put(&p->rx, (unsigned char)b);
+                            if (p->iac_has_pending) {
+                                p->iac_has_pending = 0;
+                                ring_put(&p->rx, p->iac_pending);
+                            }
+                        }
+                        if (g_block_mode) {
+                            static unsigned short binrx_log = 0;
+                            static unsigned short binrx_sess = 0;
+                            if (binrx_sess != g_diag_session) { binrx_sess = g_diag_session; binrx_log = 0; }
+                            if (binrx_log < 20) {
+                                binrx_log++;
+                                dbg_hex("[RX:", (unsigned char)(n & 0xFF));
+                                if (n >= 1) dbg_hex("", tmp[0]);
+                                if (n >= 2) dbg_hex("", tmp[1]);
+                                if (n >= 3) dbg_hex("", tmp[2]);
+                                if (n >= 4) dbg_hex("", tmp[3]);
+                                dbg("]");
+                            }
                         }
                     }
                 } else {
                     break;
                 }
             }
+
+            /* Defeat mTCP's reportSmallWindow restriction.
+             * mTCP halves the advertised TCP window (caps at MSS ~536)
+             * after 4+ consecutive sequence errors.  In a VM with SLIRP,
+             * brief packet bursts trigger spurious sequence errors.  The
+             * restricted window then creates a death spiral: low window →
+             * slow data rate → ZMODEM timeout.  Recovery needs 50 good
+             * packets in a row, which is hard at restricted throughput.
+             *
+             * Forcibly clear the restriction every poll cycle.  This is
+             * safe because SLIRP doesn't have real congestion. */
+            if (p->sock->reportSmallWindow) {
+                static unsigned short smw_log = 0;
+                p->sock->reportSmallWindow = false;
+                p->sock->consecutiveSeqErrs = 0;
+                p->sock->consecutiveGoodPackets = 50;
+                if (smw_log < 10) {
+                    smw_log++;
+                    dbg("[SMW-CLR]");
+                }
+            }
+
+            /* Process any packets that arrived during the recv drain
+             * loop above, then drive outgoing packets.  This ensures:
+             * 1. Incoming TCP segments are processed promptly (not
+             *    delayed until the next poll cycle)
+             * 2. TCP ACKs reflect the latest received data
+             * 3. Window-update ACKs (from recv() reopening a zero
+             *    window) are transmitted immediately */
+            while (Buffer_first != Buffer_next) {
+                g_state.pkt_count++;
+                PACKET_PROCESS_SINGLE;
+            }
+            Tcp::drivePackets();
 
             /* Keepalive: send IAC NOP every ~30s to probe connection.
              * SLIRP doesn't propagate external TCP close to the internal
@@ -496,7 +568,19 @@ void do_mtcp_poll(void)
                                g_state.dbglog,
                                h, &written);
             }
-            _dos_commit(g_state.dbglog_fd);
+            /* Throttle _dos_commit to once per second (~18 ticks).
+             * _dos_commit flushes FAT buffers to disk and is very slow.
+             * Calling it every poll cycle during ZMODEM's tight AH=18h
+             * loop starves TCP ACK generation.  Once per second keeps
+             * the log retrievable while maintaining poll throughput. */
+            {
+                static unsigned long last_commit_tick = 0;
+                unsigned long ct = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                if (ct - last_commit_tick >= 18UL) {
+                    last_commit_tick = ct;
+                    _dos_commit(g_state.dbglog_fd);
+                }
+            }
 
             /* Restore original PSP */
             __asm {

@@ -537,7 +537,7 @@ int main(int argc, char *argv[])
         if (p->initialized && p->localPort != 0 &&
             p->listenSock == NULL && p->huntGroupIdx < 0) {
             TcpSocket *ls = TcpSocketMgr::getSocket();
-            if (ls && ls->listen(p->localPort, 2048) == 0) {
+            if (ls && ls->listen(p->localPort, 16384) == 0) {
                 p->listenSock = ls;
                 if (eager_listen) {
                     p->mode = PORT_LISTEN;
@@ -556,7 +556,7 @@ int main(int argc, char *argv[])
         if (g_state.huntGroups[i].active &&
             g_state.huntGroups[i].listenSock == NULL) {
             TcpSocket *ls = TcpSocketMgr::getSocket();
-            if (ls && ls->listen(g_state.huntGroups[i].tcpPort, 2048) == 0) {
+            if (ls && ls->listen(g_state.huntGroups[i].tcpPort, 16384) == 0) {
                 int j;
                 g_state.huntGroups[i].listenSock = ls;
                 for (j = 0; j < MAX_PORTS; j++) {

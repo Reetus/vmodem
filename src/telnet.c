@@ -65,11 +65,14 @@ void telnet_on_connect(int port_idx)
     PortState *p = &g_state.ports[port_idx];
     unsigned char neg[15];
 
-    /* Reset parser */
-    p->iac_state = IAC_NORMAL;
-    p->iac_cmd   = 0;
-    p->neg_echo  = 0;
-    p->neg_sga   = 0;
+    /* Reset parser and negotiation flags */
+    p->iac_state       = IAC_NORMAL;
+    p->iac_cmd         = 0;
+    p->iac_has_pending = 0;
+    p->iac_pending     = 0;
+    p->neg_binary = 0;
+    p->neg_echo   = 0;
+    p->neg_sga    = 0;
     p->neg_naws  = 0;
     p->neg_ttype = 0;
     p->sb_opt    = 0;
@@ -79,14 +82,29 @@ void telnet_on_connect(int port_idx)
     p->ttype[0]  = '\0';
 
     /* Build negotiation sequence:
-     *   WILL ECHO, WILL SGA, DO SGA, DO NAWS, DO TTYPE */
-    neg[0] = TEL_IAC;  neg[1] = TEL_WILL; neg[2] = TELOPT_ECHO;
-    neg[3] = TEL_IAC;  neg[4] = TEL_WILL; neg[5] = TELOPT_SGA;
-    neg[6] = TEL_IAC;  neg[7] = TEL_DO;   neg[8] = TELOPT_SGA;
-    neg[9] = TEL_IAC;  neg[10] = TEL_DO;  neg[11] = TELOPT_NAWS;
-    neg[12] = TEL_IAC; neg[13] = TEL_DO;  neg[14] = TELOPT_TTYPE;
+     *   WILL BINARY, DO BINARY (RFC 856 — both directions),
+     *   WILL ECHO, WILL SGA, DO SGA, DO NAWS, DO TTYPE
+     *
+     * BINARY mode is critical: without it, telnet translates CR to
+     * CR+NUL, which corrupts ZMODEM and other binary protocols. */
+    neg[0]  = TEL_IAC; neg[1]  = TEL_WILL; neg[2]  = TELOPT_BINARY;
+    neg[3]  = TEL_IAC; neg[4]  = TEL_DO;   neg[5]  = TELOPT_BINARY;
+    neg[6]  = TEL_IAC; neg[7]  = TEL_WILL; neg[8]  = TELOPT_ECHO;
+    neg[9]  = TEL_IAC; neg[10] = TEL_WILL; neg[11] = TELOPT_SGA;
+    neg[12] = TEL_IAC; neg[13] = TEL_DO;   neg[14] = TELOPT_SGA;
 
     telnet_send_raw(p, neg, 15);
+
+    /* Don't set neg_binary/echo/sga=1 here — let the remote's
+     * DO/WILL response set them via telnet_handle_option.
+     * This allows the normal double-confirmation flow that
+     * SyncTERM expects. */
+
+    /* Second batch (buf reuse) */
+    neg[0] = TEL_IAC; neg[1] = TEL_DO;  neg[2] = TELOPT_NAWS;
+    neg[3] = TEL_IAC; neg[4] = TEL_DO;  neg[5] = TELOPT_TTYPE;
+
+    telnet_send_raw(p, neg, 6);
 }
 
 /* -----------------------------------------------------------------------
@@ -143,19 +161,25 @@ static void telnet_handle_option(PortState *p,
     switch (cmd) {
 
     case TEL_DO:
-        if (opt == TELOPT_ECHO && !p->neg_echo) {
+        if (opt == TELOPT_BINARY && !p->neg_binary) {
+            p->neg_binary = 1;
+            telnet_send_response(p, TEL_WILL, opt);
+        } else if (opt == TELOPT_ECHO && !p->neg_echo) {
             p->neg_echo = 1;
             telnet_send_response(p, TEL_WILL, opt);
         } else if (opt == TELOPT_SGA && !p->neg_sga) {
             p->neg_sga = 1;
             telnet_send_response(p, TEL_WILL, opt);
-        } else if (opt != TELOPT_ECHO && opt != TELOPT_SGA) {
+        } else if (opt != TELOPT_BINARY && opt != TELOPT_ECHO && opt != TELOPT_SGA) {
             telnet_send_response(p, TEL_WONT, opt);
         }
         break;
 
     case TEL_WILL:
-        if (opt == TELOPT_SGA && !p->neg_sga) {
+        if (opt == TELOPT_BINARY && !p->neg_binary) {
+            p->neg_binary = 1;
+            telnet_send_response(p, TEL_DO, opt);
+        } else if (opt == TELOPT_SGA && !p->neg_sga) {
             p->neg_sga = 1;
             telnet_send_response(p, TEL_DO, opt);
         } else if (opt == TELOPT_NAWS && !p->neg_naws) {
@@ -171,7 +195,8 @@ static void telnet_handle_option(PortState *p,
                 ttype_req[4] = TEL_IAC;  ttype_req[5] = TEL_SE;
                 telnet_send_raw(p, ttype_req, 6);
             }
-        } else if (opt != TELOPT_SGA && opt != TELOPT_NAWS && opt != TELOPT_TTYPE) {
+        } else if (opt != TELOPT_BINARY && opt != TELOPT_SGA &&
+                   opt != TELOPT_NAWS && opt != TELOPT_TTYPE) {
             telnet_send_response(p, TEL_DONT, opt);
         }
         break;
@@ -206,6 +231,13 @@ int telnet_filter(PortState *p, unsigned char b)
     case IAC_NORMAL:
         if (b == TEL_IAC) {
             p->iac_state = IAC_SAW_FF;
+            /* Debug: count IAC events to detect unescaped 0xFF in data */
+            {
+                static unsigned short iac_count = 0;
+                iac_count++;
+                if (iac_count == 20 || iac_count == 50 || iac_count == 100)
+                    dbg_hex("[IAC#", (unsigned char)(iac_count & 0xFF));
+            }
             return -1;              /* consumed — wait for command byte */
         }
         return (int)b;             /* plain data byte */
@@ -216,6 +248,18 @@ int telnet_filter(PortState *p, unsigned char b)
             p->iac_state = IAC_NORMAL;
             return 0xFF;
         }
+        /* Process telnet commands in ALL modes (including BINARY).
+         * RFC 856: IAC is still the escape character in BINARY mode.
+         * IAC IAC = literal 0xFF; all other IAC sequences are commands.
+         *
+         * SyncTERM (and compliant clients) IAC-escape 0xFF in data
+         * (sending FF FF), so data bytes 0xFB-0xFE never appear as
+         * FF FB / FF FC etc. in the TCP stream.
+         *
+         * Late-arriving telnet negotiations (WILL NAWS, TTYPE subneg)
+         * MUST be consumed here — otherwise they inject extra bytes
+         * into the ZMODEM data stream, causing position mismatch
+         * between sender and receiver. */
         if (b == TEL_WILL || b == TEL_WONT ||
             b == TEL_DO   || b == TEL_DONT) {
             p->iac_cmd   = b;
@@ -228,7 +272,9 @@ int telnet_filter(PortState *p, unsigned char b)
             p->iac_state = IAC_IN_SB;
             return -1;
         }
-        /* Any other command (IP, AO, SE, NOP, …) — ignore */
+        /* Unknown command byte — consume it */
+        dbg_hex("[IAC-UNK:", b);
+        dbg("]");
         p->iac_state = IAC_NORMAL;
         return -1;
 
