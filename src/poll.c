@@ -47,6 +47,17 @@ void do_mtcp_poll(void)
 {
     int i;
 
+    /* Drain deferred close queue — call isCloseDone() which internally
+     * calls destroy() (frees recv buffer, removes from active table)
+     * when the TCP close completes or times out, then freeSocket(). */
+    for (i = g_closing_count - 1; i >= 0; i--) {
+        if (g_closing_sockets[i]->isCloseDone()) {
+            TcpSocketMgr::freeSocket(g_closing_sockets[i]);
+            /* Remove from queue by swapping with last */
+            g_closing_sockets[i] = g_closing_sockets[--g_closing_count];
+        }
+    }
+
     g_state.poll_count++;
 
     g_state.poll_phase = 0;  /* entering poll */

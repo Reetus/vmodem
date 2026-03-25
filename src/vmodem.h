@@ -283,11 +283,28 @@ void at_check_ring(int port_idx);
  * until the FIN-ACK arrives.  If the remote is gone and the timer tick
  * interrupt can't fire (IF=0 in INT 14h context, or remote simply never
  * responds), the loop never terminates and the system hangs. */
+/* Deferred close queue — sockets that have started a non-blocking close
+ * but need isCloseDone() called to complete cleanup (frees recv buffer,
+ * removes from active table).  Processed in the poll cycle. */
+#define MAX_CLOSING_SOCKETS 4
+extern TcpSocket *g_closing_sockets[MAX_CLOSING_SOCKETS];
+extern int g_closing_count;
+
+/* Start a non-blocking close and queue the socket for deferred cleanup.
+ * The poll cycle calls sock_close_drain() to finish the process. */
 static inline void sock_close_fast(TcpSocket *s)
 {
     s->closeNonblocking();    /* sends FIN, returns immediately */
     Tcp::drivePackets();      /* push the FIN out if possible */
-    TcpSocketMgr::freeSocket(s);
+
+    /* Queue for deferred destroy+free via isCloseDone() in poll cycle */
+    if (g_closing_count < MAX_CLOSING_SOCKETS) {
+        g_closing_sockets[g_closing_count++] = s;
+    } else {
+        /* Queue full — last resort: free without destroy.
+         * This leaks the recv buffer but avoids a hang. */
+        TcpSocketMgr::freeSocket(s);
+    }
 }
 
 /* vmodem.c - control commands (callable from INT 2Fh handler) */

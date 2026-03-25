@@ -35,6 +35,10 @@
 
 VModemState  g_state;
 
+/* Deferred close queue (see vmodem.h sock_close_fast) */
+TcpSocket *g_closing_sockets[MAX_CLOSING_SOCKETS];
+int g_closing_count = 0;
+
 /* InDOS flag pointer — obtained via INT 21h AH=34h at startup.
  * When *g_indos_ptr == 0, DOS is not in a system call and file I/O is safe. */
 unsigned char __far *g_indos_ptr = NULL;
