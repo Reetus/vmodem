@@ -337,7 +337,7 @@ void __interrupt __far __loadds int2f_handler(void)
             g_state.mux_sock_result = 0xFF;
             break;
         }
-        if (ns->setRecvBuffer(512) != 0) {
+        if (ns->setRecvBuffer(4096) != 0) {
             dbg("[ALLOC-NOMEM]");
             TcpSocketMgr::freeSocket(ns);
             g_state.mux_sock_result = 0xFF;

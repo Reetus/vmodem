@@ -28,7 +28,7 @@ static unsigned char vsock_allocated[MAX_VSOCK];
  * The MUX handler reads/writes via ES:BX where ES=DS (DGROUP).
  * In large model, caller buffers may be in other segments, so we
  * copy through this near buffer. */
-static unsigned char mux_staging[256];
+static unsigned char mux_staging[1024];
 
 /* ---- Static storage for gethostbyname ---- */
 static struct hostent  s_hostent;
@@ -325,7 +325,7 @@ int send(int sockfd, const void *buf, int len, int flags)
         int n, i;
 
         chunk = (unsigned short)(len - total);
-        if (chunk > 256) chunk = 256;
+        if (chunk > 1024) chunk = 1024;
 
         /* Copy caller's buffer to DGROUP staging (required for large model
          * where caller data may be in a different segment) */
