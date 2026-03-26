@@ -406,6 +406,29 @@ int closesocket(int sockfd)
     return 0;
 }
 
+int vsock_data_ready(int sockfd)
+{
+    int h;
+    unsigned short result;
+
+    h = fd_to_handle(sockfd);
+    if (h < 0) return 0;
+
+    mux_poll_internal();
+
+    {
+        unsigned char hb = (unsigned char)h;
+        __asm {
+            mov  ah, MUX_ID
+            mov  al, MUX_SOCK_RECV_READY
+            mov  cl, hb
+            int  2Fh
+        }
+    }
+    result = mux_get_result();
+    return (int)result;
+}
+
 /* -----------------------------------------------------------------------
  * Name resolution
  * ----------------------------------------------------------------------- */

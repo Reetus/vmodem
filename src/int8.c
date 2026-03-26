@@ -621,6 +621,20 @@ void __interrupt __far __loadds int2f_handler(void)
         break;
     }
 
+    case MUX_SOCK_RECV_READY:
+    {
+        /* Check if a socket has data waiting to be read.
+         * CL = handle.  Returns 1 if data waiting, 0 otherwise. */
+        unsigned char handle = (unsigned char)(orig_cx & 0xFF);
+        unsigned short ready = 0;
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL) {
+            if (g_state.ext_sockets[handle].sock->recvDataWaiting())
+                ready = 1;
+        }
+        g_state.mux_sock_result = ready;
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh

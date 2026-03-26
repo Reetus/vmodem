@@ -19,7 +19,7 @@
 # Paths
 # -------------------------------------------------------------------------
 
-MTCP_ROOT = ../../mtcp/mTCP-src_2025-01-10
+MTCP_ROOT = ../../mtcp
 TCPLIB    = $(MTCP_ROOT)/TCPLIB
 TCPINC    = $(MTCP_ROOT)/TCPINC
 INC       = $(MTCP_ROOT)/INCLUDE

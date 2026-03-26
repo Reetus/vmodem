@@ -77,6 +77,10 @@ struct hostent {
 };
 #define h_addr h_addr_list[0]
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- Global error state ---- */
 extern int vsock_errno;
 extern int h_errno;
@@ -104,5 +108,10 @@ in_addr_t       inet_addr(const char *cp);
 /* ---- VMODEM extensions ---- */
 int             vsock_init(void);   /* check TSR loaded; returns 0=ok, -1=absent */
 void            vsock_poll(void);   /* drive one mTCP poll cycle */
+int             vsock_data_ready(int sockfd); /* 1 if recv data waiting, 0 if not */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _VSOCKET_H */
