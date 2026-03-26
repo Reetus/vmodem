@@ -635,6 +635,27 @@ void __interrupt __far __loadds int2f_handler(void)
         break;
     }
 
+    case MUX_SOCK_DNS_FLUSH:
+    {
+        /* Flush a hostname from mTCP's DNS cache so the next resolve
+         * gets a fresh query.  ES:BX -> hostname string. */
+        unsigned char __far *src;
+        char name[64];
+        int i;
+        __asm {
+            mov  ax, [bp+4]
+            mov  word ptr src+2, ax
+            mov  ax, [bp+16]
+            mov  word ptr src, ax
+        }
+        for (i = 0; i < 63 && src[i] != 0; i++)
+            name[i] = src[i];
+        name[i] = '\0';
+        Dns::deleteFromCache(name);
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
     case MUX_UNLOAD:
         /*
          * Restore all hooked vectors.  We do this from inside the INT 2Fh

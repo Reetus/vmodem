@@ -343,9 +343,10 @@ int send(int sockfd, const void *buf, int len, int flags)
                 vsock_errno = VSOCK_ECONNRESET;
                 return total > 0 ? total : -1;
             }
+            dos_idle();
             mux_poll_internal();
             retries++;
-            if (retries > 200) {
+            if (retries > 2000) {
                 vsock_errno = VSOCK_ETIMEDOUT;
                 return total > 0 ? total : -1;
             }
@@ -366,6 +367,7 @@ int recv(int sockfd, void *buf, int len, int flags)
     h = fd_to_handle(sockfd);
     if (h < 0) return -1;
 
+    dos_idle();
     mux_poll_internal();
 
     chunk = (unsigned short)len;
@@ -512,6 +514,26 @@ static int mux_resolve_result(unsigned char *ip_buf)
         ip_buf[3] = mux_staging[3];
     }
     return state;
+}
+
+void vsock_dns_flush(const char *hostname)
+{
+    /* Copy hostname to DGROUP, then call MUX to flush DNS cache entry */
+    int i;
+    for (i = 0; i < 63 && hostname[i]; i++)
+        s_hostname[i] = hostname[i];
+    s_hostname[i] = '\0';
+
+    __asm {
+        push es
+        push ss
+        pop  es
+        mov  ah, MUX_ID
+        mov  al, MUX_SOCK_DNS_FLUSH
+        lea  bx, s_hostname
+        int  2Fh
+        pop  es
+    }
 }
 
 static void fill_hostent(const char *name, in_addr_t addr)

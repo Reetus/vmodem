@@ -103,6 +103,7 @@ int             closesocket(int sockfd);
 
 /* ---- Name resolution ---- */
 struct hostent *gethostbyname(const char *name);
+void            vsock_dns_flush(const char *hostname);
 in_addr_t       inet_addr(const char *cp);
 
 /* ---- VMODEM extensions ---- */

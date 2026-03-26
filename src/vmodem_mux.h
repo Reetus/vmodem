@@ -41,6 +41,7 @@
 #define MUX_PORT_NAWS    0x19   /* CL=port(0-3); ret DX=cols, SI=rows    */
 #define MUX_PORT_TTYPE   0x1A   /* CL=port(0-3), DX=bufsz, ES:BX->buf   */
 #define MUX_SOCK_RECV_READY 0x1B /* CL=handle; ret AX=1 if data waiting  */
+#define MUX_SOCK_DNS_FLUSH  0x1C /* ES:BX->hostname; flush DNS cache entry */
 
 #define MAX_EXT_SOCKETS  4
 

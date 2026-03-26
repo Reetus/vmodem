@@ -287,6 +287,8 @@ Runtime control and external socket API. Subcommands 00h–07h control the TSR; 
 | 18h | DNS result | ES:BX→4-byte IP buf; returns AL=state |
 | 19h | Port NAWS | CL=port(0–3); returns DX=cols, SI=rows |
 | 1Ah | Port TTYPE | CL=port(0–3), DX=bufsz, ES:BX→buf; returns AX=len |
+| 1Bh | Recv ready | CL=handle; returns AX=1 if data waiting |
+| 1Ch | DNS flush | ES:BX→hostname; flush DNS cache entry |
 | FFh | Unload | Restore vectors, free TSR memory |
 
 ### Port State Machine
@@ -360,6 +362,77 @@ int main(void)
 - `recv()` is non-blocking: returns bytes received, 0 if no data available, or -1 on error/remote close
 
 **This library is published in case it's useful to someone, but is not supported. Use at your own risk.**
+
+## TLS 1.2 Library (vtls.lib)
+
+A minimal TLS 1.2 client library for DOS. Performs a full TLS handshake over a vsocket TCP connection, providing encrypted communication with modern servers. Crypto primitives are derived from [PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/)/[ssh2dos](https://sourceforge.net/projects/azeret/) (AES, SHA-1, bignum RSA) with a new SHA-256 implementation for the TLS 1.2 PRF.
+
+**Cipher suite:** `TLS_RSA_WITH_AES_128_CBC_SHA` (0x002F) — RSA key exchange, AES-128-CBC encryption, HMAC-SHA1 integrity. This is the only suite supported.
+
+```c
+#include "vsocket.h"
+#include "vtls.h"
+
+int main(void)
+{
+    struct sockaddr_in addr;
+    char buf[256], cn[128];
+    int s, n;
+
+    if (vsock_init() != 0) return 1;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    /* ... set up addr ... */
+    connect(s, (struct sockaddr *)&addr, sizeof(addr));
+
+    /* TLS handshake (RSA key exchange, ~2-10 sec depending on key size) */
+    if (vtls_handshake(s) < 0) { /* error */ }
+
+    /* Peer certificate info */
+    vtls_peer_cn(s, cn, sizeof(cn));      /* e.g. "calcium.libera.chat" */
+    vtls_peer_key_bits(s);                 /* e.g. 4096 */
+
+    /* Send/receive over encrypted channel */
+    vtls_send(s, "NICK dos\r\n", 10);
+    n = vtls_recv(s, buf, sizeof(buf));
+
+    vtls_close(s);       /* close TLS session */
+    closesocket(s);      /* close TCP socket */
+    return 0;
+}
+```
+
+### API
+
+| Function | Description |
+|----------|-------------|
+| `vtls_handshake(sock)` | Perform TLS 1.2 handshake on a connected TCP socket. Returns 0 on success, -1 on failure. |
+| `vtls_send(sock, buf, len)` | Send data over TLS. Returns bytes sent or -1 on error. |
+| `vtls_recv(sock, buf, len)` | Receive data over TLS. Returns bytes received, 0 if none available, -1 on error/close. |
+| `vtls_peer_cn(sock, buf, buflen)` | Get the peer certificate Subject CN. Returns length or -1. |
+| `vtls_peer_key_bits(sock)` | Get the peer RSA key size in bits (e.g. 2048, 4096). Returns -1 if unavailable. |
+| `vtls_close(sock)` | Close the TLS session. Does **not** close the underlying TCP socket. |
+
+### Implementation Details
+
+- **Handshake:** ClientHello → ServerHello + Certificate + ServerHelloDone → ClientKeyExchange + ChangeCipherSpec + Finished → server ChangeCipherSpec + Finished
+- **RSA:** Bignum arithmetic with bit-at-a-time modular exponentiation. Supports 2048-bit and 4096-bit server keys. 4096-bit handshakes take ~10 seconds on a 486-class CPU.
+- **X.509:** Minimal ASN.1/DER parser — extracts the RSA public key (modulus + exponent) and Subject CN from the first certificate in the server's chain. No chain validation or CA trust store.
+- **Record layer:** TLS records are encrypted with AES-128-CBC and authenticated with HMAC-SHA1. Sequence numbers are tracked for replay protection.
+- **PRF:** TLS 1.2 PRF using HMAC-SHA256 (P_SHA256) for key derivation and Finished message computation.
+- **Memory:** Up to 4 simultaneous TLS connections. Per-connection state (AES contexts, MAC keys, receive buffer) uses ~3 KB in DGROUP plus a malloc'd application data buffer.
+- **No certificate verification** — the server's certificate is accepted unconditionally. This is a pragmatic choice for a DOS IRC client, not a security recommendation.
+
+### Limitations
+
+- RSA key exchange only (no DHE, ECDHE, or TLS 1.3)
+- Single cipher suite (`AES_128_CBC_SHA`)
+- No client certificates
+- No SNI (Server Name Indication)
+- No session resumption
+- No certificate chain validation
+
+**Tested against:** Libera.Chat IRC (4096-bit RSA), local test servers (2048-bit RSA).
 
 ## License
 

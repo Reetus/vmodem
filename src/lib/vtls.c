@@ -1086,7 +1086,7 @@ static int tls_send_all(int s, const unsigned char *buf, int len)
         int n;
         vsock_poll();
         n = send(s, buf + sent, len - sent, 0);
-        if (n < 0) { vtls_log("send failed at %d/%d\n", sent, len); return -1; }
+        if (n < 0) { vtls_log("send failed at %d/%d errno=%d\n", sent, len, vsock_errno); return -1; }
         sent += n;
     }
     return sent;
@@ -1304,6 +1304,11 @@ int vtls_handshake(int sockfd)
     const unsigned char *rsa_n, *rsa_e;
     int rsa_n_len, rsa_e_len;
     int cert_requested = 0;
+
+    /* Give the TCP connection a moment to stabilize */
+    { int i; for (i = 0; i < 10; i++) vsock_poll(); }
+
+    vtls_log("handshake start sock=%d data_ready=%d\n", sockfd, vsock_data_ready(sockfd));
 
     c = alloc_conn(sockfd);
     if (!c) { vtls_log("alloc_conn failed\n"); return -1; }
