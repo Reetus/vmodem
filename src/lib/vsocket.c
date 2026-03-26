@@ -367,7 +367,6 @@ int recv(int sockfd, void *buf, int len, int flags)
     h = fd_to_handle(sockfd);
     if (h < 0) return -1;
 
-    dos_idle();
     mux_poll_internal();
 
     chunk = (unsigned short)len;
