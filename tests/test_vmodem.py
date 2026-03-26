@@ -45,6 +45,12 @@ from test_reconnect import test_reconnect
 from test_hunt_ring_timeout import test_hunt_ring_timeout
 from test_tcp_out import test_tcp_out
 from test_relay import test_relay
+from test_single_busy import test_single_busy
+from test_naws import test_naws
+from test_ttype import test_ttype
+from test_tls_irc import test_tls_irc
+from test_vping import test_vping
+from test_vtracert import test_vtracert
 
 
 ALL_TESTS = {
@@ -65,6 +71,12 @@ ALL_TESTS = {
     "test_hunt_ring_timeout": test_hunt_ring_timeout,
     "test_tcp_out": test_tcp_out,
     "test_relay": test_relay,
+    "test_single_busy": test_single_busy,
+    "test_naws": test_naws,
+    "test_ttype": test_ttype,
+    "test_tls_irc": test_tls_irc,
+    "test_vping": test_vping,
+    "test_vtracert": test_vtracert,
 }
 
 
@@ -83,6 +95,17 @@ def main():
         for name in ALL_TESTS:
             print(f"  {name}")
         return 0
+
+    # Kill stale DOSBox-X processes from previous test runs
+    import subprocess, signal
+    try:
+        result = subprocess.run(["pgrep", "-f", "dosbox-x.*vmodem_test"],
+                                capture_output=True, text=True)
+        for pid in result.stdout.strip().split("\n"):
+            if pid:
+                os.kill(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, ValueError, FileNotFoundError):
+        pass
 
     # Clean up stale test temp directories
     import glob as glob_mod

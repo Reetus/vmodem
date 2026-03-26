@@ -38,6 +38,10 @@
 #define MUX_SOCK_RESULT  0x16   /* ret AX=last mux_sock_result            */
 #define MUX_SOCK_RESOLVE 0x17   /* ES:BX->hostname; initiates DNS query   */
 #define MUX_SOCK_RESOLVE_RESULT 0x18  /* ES:BX->4-byte IP buf; ret AL=state */
+#define MUX_PORT_NAWS    0x19   /* CL=port(0-3); ret DX=cols, SI=rows    */
+#define MUX_PORT_TTYPE   0x1A   /* CL=port(0-3), DX=bufsz, ES:BX->buf   */
+#define MUX_SOCK_RECV_READY 0x1B /* CL=handle; ret AX=1 if data waiting  */
+#define MUX_SOCK_DNS_FLUSH  0x1C /* ES:BX->hostname; flush DNS cache entry */
 
 #define MAX_EXT_SOCKETS  4
 
@@ -54,6 +58,28 @@
 #define DNS_RESOLVE_PENDING    1
 #define DNS_RESOLVE_OK         2
 #define DNS_RESOLVE_ERROR      3
+
+/* ---- ICMP ping/traceroute API ---- */
+#define MUX_ICMP_SEND       0x20   /* CL=TTL, DX=seq, ES:BX->4-byte dest IP */
+#define MUX_ICMP_POLL       0x21   /* ret AX=ICMP_STATE_*                    */
+#define MUX_ICMP_RESULT     0x22   /* ES:BX->IcmpMuxResult buffer            */
+
+/* ICMP request states (returned by MUX_ICMP_POLL) */
+#define ICMP_STATE_IDLE      0
+#define ICMP_STATE_WAITING   1
+#define ICMP_STATE_REPLY     2
+#define ICMP_STATE_TIMEOUT   3
+
+/* ICMP response details (returned by MUX_ICMP_RESULT) */
+typedef struct {
+    unsigned char  resp_type;      /* ICMP type (0=echo reply, 11=time exceeded, 3=unreach) */
+    unsigned char  resp_code;
+    unsigned char  resp_ip[4];     /* source IP of the ICMP response */
+    unsigned short resp_seq;
+    unsigned short resp_rtt_ticks; /* round-trip time in BIOS ticks (~55ms each) */
+    unsigned char  resp_ttl;       /* TTL from response IP header */
+    unsigned char  _pad;
+} IcmpMuxResult;
 
 #define VMODEM_SIG       "VMODEM10"
 #define VMODEM_SIG_LEN   8

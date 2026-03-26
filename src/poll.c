@@ -33,6 +33,62 @@ extern unsigned char g_dos_safe;
 extern unsigned char g_int14_safe;
 
 /* -----------------------------------------------------------------------
+ * ICMP callback — receives ALL incoming ICMP packets from mTCP.
+ * Checks if this is a response to our outstanding echo request.
+ * --------------------------------------------------------------------- */
+
+void vmodem_icmp_handler(const unsigned char *packet, const IcmpHeader *icmp)
+{
+    IpHeader *ip;
+    unsigned long now;
+
+    if (g_state.icmp_state != ICMP_STATE_WAITING)
+        return;
+
+    /* Ethernet header is always 14 bytes on the wire (6+6+2).
+     * Use literal to avoid any sizeof(EthHeader) packing surprises. */
+    ip = (IpHeader *)(packet + 14);
+    now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+
+    if (icmp->type == ICMP_ECHO_REPLY) {
+        /* Echo Reply: verify ident and seq match our request */
+        uint16_t *ident_ptr = (uint16_t *)icmp->payloadPtr();
+        uint16_t *seq_ptr   = ident_ptr + 1;
+        if (*ident_ptr != 0xC3C3)
+            return;
+        if (*seq_ptr != htons(g_state.icmp_seq))
+            return;
+    } else if (icmp->type == 11 || icmp->type == 3) {
+        /* Time Exceeded (11) or Destination Unreachable (3).
+         * Payload: [4 bytes unused][original IP header][8 bytes of original data]
+         * The 8 bytes are our ICMP header(4) + ident(2) + seq(2). */
+        uint8_t *payload = icmp->payloadPtr();
+        IpHeader *orig_ip = (IpHeader *)(payload + 4); /* skip 4 unused bytes */
+        uint16_t *orig_ident = (uint16_t *)(((uint8_t *)orig_ip) + orig_ip->getIpHlen() + 4);
+        if (*orig_ident != 0xC3C3)
+            return;
+    } else {
+        return;
+    }
+
+    {
+        unsigned char *r = (unsigned char *)&g_state.icmp_result;
+        r[0] = icmp->type;                          /* resp_type */
+        r[1] = icmp->code;                          /* resp_code */
+        r[2] = ip->ip_src[0];                       /* resp_ip[0] */
+        r[3] = ip->ip_src[1];                       /* resp_ip[1] */
+        r[4] = ip->ip_src[2];                       /* resp_ip[2] */
+        r[5] = ip->ip_src[3];                       /* resp_ip[3] */
+        *(unsigned short *)(r + 6) = g_state.icmp_seq; /* resp_seq */
+        *(unsigned short *)(r + 8) = (unsigned short)(now - g_state.icmp_send_tick); /* resp_rtt_ticks */
+        r[10] = ip->ttl;                            /* resp_ttl */
+        r[11] = 0;                                  /* _pad */
+    }
+
+    g_state.icmp_state = ICMP_STATE_REPLY;
+}
+
+/* -----------------------------------------------------------------------
  * do_mtcp_poll
  *
  * Drives all mTCP layers, then services each port:
@@ -47,8 +103,22 @@ void do_mtcp_poll(void)
 {
     int i;
 
+    /* Drain deferred close queue — call isCloseDone() which internally
+     * calls destroy() (frees recv buffer, removes from active table)
+     * when the TCP close completes or times out, then freeSocket(). */
+    for (i = g_closing_count - 1; i >= 0; i--) {
+        if (g_closing_sockets[i]->isCloseDone()) {
+            TcpSocketMgr::freeSocket(g_closing_sockets[i]);
+            /* Remove from queue by swapping with last */
+            g_closing_sockets[i] = g_closing_sockets[--g_closing_count];
+        }
+    }
+
     g_state.poll_count++;
+
     g_state.poll_phase = 0;  /* entering poll */
+    if (g_state.poll_count <= 3)
+        dbg("[POLL]");
 
     /* Step 0: Periodic ARP keepalive for SLIRP/pcap.
      * Send ARP request every ~1 second to keep the path active. */
@@ -63,11 +133,9 @@ void do_mtcp_poll(void)
 
     g_state.poll_phase = 1;  /* packet processing */
     /* Step 1: Drive the mTCP network stack.
-     * Process up to 4 packets per poll cycle to catch SLIRP-queued
-     * TCP packets that arrive asynchronously after an ARP keepalive. */
+     * Process all pending packets from the packet driver ring buffer. */
     {
-        int pkt_loops = 4;
-        while (pkt_loops-- > 0 && Buffer_first != Buffer_next) {
+        while (Buffer_first != Buffer_next) {
             g_state.pkt_count++;
             PACKET_PROCESS_SINGLE;
         }
@@ -83,6 +151,42 @@ void do_mtcp_poll(void)
     Tcp::drivePackets();
     g_state.poll_phase = 4;  /* DNS */
     Dns::drivePendingQuery();
+
+    /* Step 1b: ICMP send — build and transmit echo request if pending */
+    if (g_state.icmp_send_pending) {
+        #define ICMP_PAYLOAD_SIZE 32
+        uint16_t icmpLen = ICMP_PAYLOAD_SIZE + sizeof(IcmpHeader) + sizeof(uint16_t) * 2;
+
+        Icmp::icmpEchoPacket.eh.setSrc(MyEthAddr);
+        Icmp::icmpEchoPacket.eh.setType(0x0800);
+
+        Icmp::icmpEchoPacket.ip.set(IP_PROTOCOL_ICMP, g_state.icmp_dest_ip, icmpLen, 0, 0);
+
+        /* Override TTL (set() hardcodes 255) and recalculate IP checksum */
+        Icmp::icmpEchoPacket.ip.ttl = g_state.icmp_ttl;
+        Icmp::icmpEchoPacket.ip.chksum = 0;
+        Icmp::icmpEchoPacket.ip.chksum = ipchksum((uint16_t *)&Icmp::icmpEchoPacket.ip, sizeof(IpHeader));
+
+        Icmp::icmpEchoPacket.icmp.type = ICMP_ECHO_REQUEST;
+        Icmp::icmpEchoPacket.icmp.code = 0;
+        Icmp::icmpEchoPacket.icmp.checksum = 0;
+        Icmp::icmpEchoPacket.ident = 0xC3C3;
+        Icmp::icmpEchoPacket.seq = htons(g_state.icmp_seq);
+
+        for (i = 0; i < ICMP_PAYLOAD_SIZE; i++)
+            Icmp::icmpEchoPacket.data[i] = (i % 26) + 'A';
+
+        Icmp::icmpEchoPacket.icmp.checksum = ipchksum((uint16_t *)&Icmp::icmpEchoPacket.icmp, icmpLen);
+
+        /* Resolve destination Ethernet address (gateway MAC for remote hosts) */
+        if (Icmp::icmpEchoPacket.ip.setDestEth(Icmp::icmpEchoPacket.eh.dest) == 0) {
+            Packet_send_pkt(&Icmp::icmpEchoPacket,
+                            icmpLen + sizeof(EthHeader) + sizeof(IpHeader));
+            g_state.icmp_send_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            g_state.icmp_send_pending = 0;
+        }
+        /* If ARP not ready, leave pending — retry next poll cycle */
+    }
 
     g_state.poll_phase = 5;  /* port servicing */
 
@@ -130,10 +234,7 @@ void do_mtcp_poll(void)
                 "\r\nAll lines are engaged. Please try again later.\r\n";
             dbg("[HUNT-REJECT]");
             ns->send(busy_msg, sizeof(busy_msg) - 1);
-            Tcp::drivePackets();
-            ns->close();
-            Tcp::drivePackets();
-            TcpSocketMgr::freeSocket(ns);
+            sock_close_fast(ns);
         }
     }
 
@@ -155,8 +256,7 @@ void do_mtcp_poll(void)
             ns = TcpSocketMgr::accept();
             if (ns) {
                 if (p->sock) {
-                    p->sock->close();
-                    TcpSocketMgr::freeSocket(p->sock);
+                    sock_close_fast(p->sock);
                 }
                 p->sock = ns;
                 p->mode = PORT_CONN;
@@ -177,22 +277,17 @@ void do_mtcp_poll(void)
                  * with ATA (or auto-answer via S0 register). */
                 at_send_ring(i);
 
-                /* Re-create listen socket so we can reject new
-                 * connections with a "busy" message during PORT_CONN. */
-                if (p->listenSock == NULL) {
-                    TcpSocket *ls = TcpSocketMgr::getSocket();
-                    if (ls) {
-                        ls->listen(p->localPort, 2048);
-                        p->listenSock = ls;
-                    }
-                }
+                /* The listen socket stays alive (mTCP spawns a new
+                 * socket for each SYN).  During PORT_CONN we check
+                 * for accept() and reject with a busy message. */
+                dbg("[SINGLE-ACCEPT]");
             }
             break;
         }
 
         case PORT_CONN:
         {
-            unsigned char tmp[64];
+            unsigned char tmp[256];
             int16_t n;
 
             if (p->sock == NULL) {
@@ -208,16 +303,43 @@ void do_mtcp_poll(void)
             /* Reject incoming connections while a call is active.
              * Hunt group members skip this — the hunt group loop
              * dispatches to other free ports or rejects if all busy. */
-            if (p->huntGroupIdx < 0 && p->listenSock) {
-                TcpSocket *ns = TcpSocketMgr::accept();
-                if (ns) {
-                    static unsigned char busy_msg[] =
-                        "\r\nLine is engaged. Please try again later.\r\n";
-                    ns->send(busy_msg, sizeof(busy_msg) - 1);
-                    Tcp::drivePackets();
-                    ns->close();
-                    Tcp::drivePackets();
-                    TcpSocketMgr::freeSocket(ns);
+            if (p->huntGroupIdx < 0) {
+                if (p->listenSock) {
+                    if (p->listenSock->state != 2) {
+                        /* Listen socket is no longer in LISTEN state —
+                         * mTCP consumed it.  Log and skip. */
+                        dbg("[LISTEN-GONE]");
+                    }
+
+                    /* Periodic diagnostic: log socket/packet state every ~5s. */
+                    {
+                        static unsigned long last_diag = 0;
+                        unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                        if (now - last_diag >= 91UL) {
+                            last_diag = now;
+                            dbg("[DIAG:");
+                            dbg_hex("A", (unsigned char)TcpSocketMgr::getActiveSockets());
+                            dbg_hex("P", (unsigned char)TcpSocketMgr::getSocketsPendingAccept());
+                            dbg_hex("L", (unsigned char)p->listenSock->state);
+                            dbg_hex("D", (unsigned char)Packets_dropped);
+                            dbg_hex("F", (unsigned char)Buffer_lowFreeCount);
+                            dbg_hex("R", (unsigned char)(Packets_received & 0xFF));
+                            dbg("]");
+                        }
+                    }
+
+                    if (TcpSocketMgr::getSocketsPendingAccept() > 0) {
+                        TcpSocket *ns = TcpSocketMgr::accept();
+                        if (ns) {
+                            static unsigned char busy_msg[] =
+                                "\r\nLine is engaged. Please try again later.\r\n";
+                            dbg("[BUSY-REJECT]");
+                            ns->send(busy_msg, sizeof(busy_msg) - 1);
+                            sock_close_fast(ns);
+                        }
+                    }
+                } else {
+                    dbg("[NO-LISTEN-SOCK]");
                 }
             }
 
@@ -253,10 +375,7 @@ void do_mtcp_poll(void)
                 p->pending_close = 0;
                 if (!silent)
                     telnet_send_text(i, "\r\nSession finished.\r\n");
-                Tcp::drivePackets();
-                p->sock->close();
-                Tcp::drivePackets();
-                TcpSocketMgr::freeSocket(p->sock);
+                sock_close_fast(p->sock);
                 p->sock = NULL;
                 memset(p->remoteIP, 0, 4);
                 p->remotePort = 0;
@@ -282,8 +401,16 @@ void do_mtcp_poll(void)
             /* Only deliver TCP data to the RX ring after the call is
              * answered.  While ringing or during connect handshake,
              * discard application data but still process telnet IAC
-             * negotiation so the connection stays healthy. */
+             * negotiation so the connection stays healthy.
+             *
+             */
             while (p->sock->recvDataWaiting()) {
+                /* Stop reading TCP if ring buffer is nearly full.
+                 * This applies back-pressure via TCP flow control,
+                 * preventing silent byte drops that corrupt ZMODEM
+                 * and other binary protocols. */
+                if (ring_count(&p->rx) > (int)(RING_SIZE - sizeof(tmp)))
+                    break;
                 n = p->sock->recv(tmp, sizeof(tmp));
                 if (n > 0) {
                     int j;
@@ -293,17 +420,83 @@ void do_mtcp_poll(void)
                          * but drop the application bytes */
                         for (j = 0; j < n; j++)
                             telnet_filter(p, tmp[j]);
+                        {
+                            static unsigned short ring_drop = 0;
+                            if (ring_drop < 4) {
+                                ring_drop++;
+                                dbg_hex("[RING-DROP:", (unsigned char)(n & 0xFF));
+                                dbg("]");
+                            }
+                        }
                     } else {
+                        /* Always run through telnet_filter — even in
+                         * BINARY mode.  SyncTERM (and many clients)
+                         * IAC-escape 0xFF outbound (FF FF → FF), so
+                         * the filter must collapse these.  The filter
+                         * also handles truly unescaped 0xFF via the
+                         * iac_pending mechanism when neg_binary=1. */
                         for (j = 0; j < n; j++) {
                             int b = telnet_filter(p, tmp[j]);
                             if (b >= 0)
                                 ring_put(&p->rx, (unsigned char)b);
+                            if (p->iac_has_pending) {
+                                p->iac_has_pending = 0;
+                                ring_put(&p->rx, p->iac_pending);
+                            }
+                        }
+                        if (g_block_mode) {
+                            static unsigned short binrx_log = 0;
+                            static unsigned short binrx_sess = 0;
+                            if (binrx_sess != g_diag_session) { binrx_sess = g_diag_session; binrx_log = 0; }
+                            if (binrx_log < 20) {
+                                binrx_log++;
+                                dbg_hex("[RX:", (unsigned char)(n & 0xFF));
+                                if (n >= 1) dbg_hex("", tmp[0]);
+                                if (n >= 2) dbg_hex("", tmp[1]);
+                                if (n >= 3) dbg_hex("", tmp[2]);
+                                if (n >= 4) dbg_hex("", tmp[3]);
+                                dbg("]");
+                            }
                         }
                     }
                 } else {
                     break;
                 }
             }
+
+            /* Defeat mTCP's reportSmallWindow restriction.
+             * mTCP halves the advertised TCP window (caps at MSS ~536)
+             * after 4+ consecutive sequence errors.  In a VM with SLIRP,
+             * brief packet bursts trigger spurious sequence errors.  The
+             * restricted window then creates a death spiral: low window →
+             * slow data rate → ZMODEM timeout.  Recovery needs 50 good
+             * packets in a row, which is hard at restricted throughput.
+             *
+             * Forcibly clear the restriction every poll cycle.  This is
+             * safe because SLIRP doesn't have real congestion. */
+            if (p->sock->reportSmallWindow) {
+                static unsigned short smw_log = 0;
+                p->sock->reportSmallWindow = false;
+                p->sock->consecutiveSeqErrs = 0;
+                p->sock->consecutiveGoodPackets = 50;
+                if (smw_log < 10) {
+                    smw_log++;
+                    dbg("[SMW-CLR]");
+                }
+            }
+
+            /* Process any packets that arrived during the recv drain
+             * loop above, then drive outgoing packets.  This ensures:
+             * 1. Incoming TCP segments are processed promptly (not
+             *    delayed until the next poll cycle)
+             * 2. TCP ACKs reflect the latest received data
+             * 3. Window-update ACKs (from recv() reopening a zero
+             *    window) are transmitted immediately */
+            while (Buffer_first != Buffer_next) {
+                g_state.pkt_count++;
+                PACKET_PROCESS_SINGLE;
+            }
+            Tcp::drivePackets();
 
             /* Keepalive: send IAC NOP every ~30s to probe connection.
              * SLIRP doesn't propagate external TCP close to the internal
@@ -339,9 +532,7 @@ void do_mtcp_poll(void)
                     if (tx_idle > timeout_ticks && rx_idle > timeout_ticks) {
                         dbg("[IDLE-TIMEOUT]");
                         telnet_send_text(i, "\r\nClosing idle connection.\r\n");
-                        p->sock->close();
-                        Tcp::drivePackets();
-                        TcpSocketMgr::freeSocket(p->sock);
+                        sock_close_fast(p->sock);
                         p->sock = NULL;
                         memset(p->remoteIP, 0, 4);
                         p->remotePort = 0;
@@ -362,8 +553,7 @@ void do_mtcp_poll(void)
                     (p->sock->isClosed() ||
                     (age > 182UL && p->sock->isRemoteClosed() && !p->sock->recvDataWaiting()))) {
                     dbg(p->sock->isClosed() ? "[DISC-CLOSED]" : "[DISC-REMOTE]");
-                    p->sock->close();
-                    TcpSocketMgr::freeSocket(p->sock);
+                    sock_close_fast(p->sock);
                     p->sock = NULL;
                     memset(p->remoteIP, 0, 4);
                     p->remotePort = 0;
@@ -415,9 +605,7 @@ void do_mtcp_poll(void)
         /* Handle deferred close (set by MUX_SOCK_CLOSE in INT 2Fh).
          * Done here where interrupts are enabled so close() can transmit FIN. */
         if (g_state.ext_sockets[i].state == EXT_SOCK_CLOSING) {
-            es->close();
-            Tcp::drivePackets();
-            TcpSocketMgr::freeSocket(es);
+            sock_close_fast(es);
             g_state.ext_sockets[i].sock = NULL;
             g_state.ext_sockets[i].state = EXT_SOCK_FREE;
             dbg("[SOCK-CLOSE]");
@@ -483,7 +671,19 @@ void do_mtcp_poll(void)
                                g_state.dbglog,
                                h, &written);
             }
-            _dos_commit(g_state.dbglog_fd);
+            /* Throttle _dos_commit to once per second (~18 ticks).
+             * _dos_commit flushes FAT buffers to disk and is very slow.
+             * Calling it every poll cycle during ZMODEM's tight AH=18h
+             * loop starves TCP ACK generation.  Once per second keeps
+             * the log retrievable while maintaining poll throughput. */
+            {
+                static unsigned long last_commit_tick = 0;
+                unsigned long ct = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+                if (ct - last_commit_tick >= 18UL) {
+                    last_commit_tick = ct;
+                    _dos_commit(g_state.dbglog_fd);
+                }
+            }
 
             /* Restore original PSP */
             __asm {

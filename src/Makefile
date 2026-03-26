@@ -19,7 +19,7 @@
 # Paths
 # -------------------------------------------------------------------------
 
-MTCP_ROOT = ../../mtcp/mTCP-src_2025-01-10
+MTCP_ROOT = ../../mtcp
 TCPLIB    = $(MTCP_ROOT)/TCPLIB
 TCPINC    = $(MTCP_ROOT)/TCPINC
 INC       = $(MTCP_ROOT)/INCLUDE
@@ -28,7 +28,7 @@ INC       = $(MTCP_ROOT)/INCLUDE
 # Compiler / Assembler flags
 # -------------------------------------------------------------------------
 
-memory_model = -ms
+memory_model = -ml
 
 # Note: use \"...\" so that CFG_H expands to "vmodem.cfg" (with quotes).
 # -fo=.obj: on Linux the OW compiler defaults to .o; force DOS OMF .obj output.
@@ -37,14 +37,14 @@ compile_opts = -0 $(memory_model) &
     -DCFG_H=\"vmodem.cfg\" &
     -fo=.obj &
     -i=$(TCPINC) -i=$(INC) -i=. &
-    -zp2 -zpw -ei -s -d2
+    -zp2 -zpw -zu -ei -s -d2
 !else
 compile_opts = -0 $(memory_model) &
     -DCFG_H=\"vmodem.cfg\" &
     -fo=.obj &
     -oh -os -oa &
     -i=$(TCPINC) -i=$(INC) -i=. &
-    -zp2 -zpw -ei -s -we
+    -zp2 -zpw -zu -ei -s -we
 !endif
 
 asm_opts = -0 $(memory_model)
@@ -65,7 +65,7 @@ VMODEM_OBJS = vmodem.obj int14.obj int8.obj poll.obj telnet.obj ringbuf.obj atcm
 # Default target
 # -------------------------------------------------------------------------
 
-all : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe vsocket.lib .symbolic
+all : vmodem.exe vmodctl.exe comdiag.exe fosschk.exe comtest.exe vsocket.lib vtls.lib .symbolic
     @echo Build complete.
 
 # -------------------------------------------------------------------------
@@ -154,9 +154,19 @@ lib/vsocket.obj : lib/vsocket.c lib/vsocket.h
 vsocket.lib : lib/vsocket.obj
     wlib -n vsocket.lib +lib/vsocket.obj
 
+# vtls: TLS 1.2 client library (uses vsocket for TCP, self-contained crypto)
+lib/vtls.obj : lib/vtls.c lib/vtls.h lib/sha256.h lib/vsocket.h
+    wcc lib/vtls -0 $(vsock_mm) -fo=lib/vtls.obj -i=lib -zp2 -zpw -s
+
+lib/sha256.obj : lib/sha256.c lib/sha256.h
+    wcc lib/sha256 -0 $(vsock_mm) -fo=lib/sha256.obj -i=lib -zp2 -zpw -s
+
+vtls.lib : lib/vtls.obj lib/sha256.obj
+    wlib -n vtls.lib +lib/vtls.obj +lib/sha256.obj
+
 # comtest: DOS test helper for automated testing (no mTCP)
-comtest.obj : ../tests/comtest.c lib/vsocket.h
-    wpp ../tests/comtest -0 $(vsock_mm) -fo=.obj -i=. -zp2 -zpw -ei -s -we
+comtest.obj : ../tests/comtest.c lib/vsocket.h lib/vtls.h
+    wpp ../tests/comtest -0 $(vsock_mm) -fo=.obj -i=. -i=lib -zp2 -zpw -ei -s -we
 
 # -------------------------------------------------------------------------
 # Link VMODEM.EXE
@@ -202,14 +212,16 @@ fosschk.exe : fosschk.obj
         name $@ &
         file fosschk.obj
 
-comtest.exe : comtest.obj vsocket.lib
+comtest.exe : comtest.obj vsocket.lib vtls.lib
     wlink &
         system dos &
         option map &
         option eliminate &
+        option stack=16384 &
         name $@ &
         file comtest.obj &
-        library vsocket.lib
+        library vsocket.lib &
+        library vtls.lib
 
 # -------------------------------------------------------------------------
 # Clean

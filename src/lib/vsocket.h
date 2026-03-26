@@ -17,6 +17,8 @@
 #ifndef _VSOCKET_H
 #define _VSOCKET_H
 
+#include "../vmodem_mux.h"   /* IcmpMuxResult, ICMP_STATE_*, MUX constants */
+
 /* ---- Address families ---- */
 #define AF_INET         2
 #define AF_UNSPEC       0
@@ -77,6 +79,10 @@ struct hostent {
 };
 #define h_addr h_addr_list[0]
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- Global error state ---- */
 extern int vsock_errno;
 extern int h_errno;
@@ -99,10 +105,21 @@ int             closesocket(int sockfd);
 
 /* ---- Name resolution ---- */
 struct hostent *gethostbyname(const char *name);
+void            vsock_dns_flush(const char *hostname);
 in_addr_t       inet_addr(const char *cp);
 
 /* ---- VMODEM extensions ---- */
 int             vsock_init(void);   /* check TSR loaded; returns 0=ok, -1=absent */
 void            vsock_poll(void);   /* drive one mTCP poll cycle */
+int             vsock_data_ready(int sockfd); /* 1 if recv data waiting, 0 if not */
+
+/* ---- ICMP ping/traceroute API ---- */
+int             vsock_icmp_send(unsigned char *dest_ip, unsigned char ttl, unsigned short seq);
+int             vsock_icmp_poll(void);   /* returns ICMP_STATE_* */
+int             vsock_icmp_result(IcmpMuxResult *result);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _VSOCKET_H */

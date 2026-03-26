@@ -35,6 +35,10 @@
 
 VModemState  g_state;
 
+/* Deferred close queue (see vmodem.h sock_close_fast) */
+TcpSocket *g_closing_sockets[MAX_CLOSING_SOCKETS];
+int g_closing_count = 0;
+
 /* InDOS flag pointer — obtained via INT 21h AH=34h at startup.
  * When *g_indos_ptr == 0, DOS is not in a system call and file I/O is safe. */
 unsigned char __far *g_indos_ptr = NULL;
@@ -453,6 +457,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Register ICMP callback for ping/traceroute MUX API */
+    extern void vmodem_icmp_handler(const unsigned char *packet, const IcmpHeader *icmp);
+    Icmp::icmpCallback = vmodem_icmp_handler;
+
     /* Register unhandled packet handler for diagnostics */
     Packet_registerDefault(unhandled_pkt_handler);
 
@@ -525,41 +533,51 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Eager listen: open listen sockets immediately instead of waiting
-     * for FOSSIL init (AH=04h).  Useful for standalone/test setups. */
-    if (eager_listen) {
-        for (i = 0; i < MAX_PORTS; i++) {
-            PortState *p = &g_state.ports[i];
-            if (p->initialized && p->localPort != 0 &&
-                p->listenSock == NULL && p->huntGroupIdx < 0) {
-                TcpSocket *ls = TcpSocketMgr::getSocket();
-                if (ls && ls->listen(p->localPort, 2048) == 0) {
-                    p->listenSock = ls;
+    /* Pre-allocate listen sockets for all configured ports.
+     * In large model, malloc() from the far heap only works reliably
+     * before _dos_keep() freezes the memory block.  Create sockets now;
+     * AH=04h (FOSSIL init) just flips the mode to PORT_LISTEN.
+     *
+     * With /E (eager listen), also set mode = PORT_LISTEN so connections
+     * are accepted immediately without waiting for FOSSIL init. */
+    for (i = 0; i < MAX_PORTS; i++) {
+        PortState *p = &g_state.ports[i];
+        if (p->initialized && p->localPort != 0 &&
+            p->listenSock == NULL && p->huntGroupIdx < 0) {
+            TcpSocket *ls = TcpSocketMgr::getSocket();
+            if (ls && ls->listen(p->localPort, 16384) == 0) {
+                p->listenSock = ls;
+                if (eager_listen) {
                     p->mode = PORT_LISTEN;
-                    printf("  COM%d: eager listen active\n", i + 1);
+                    printf("  COM%d: listen active (eager)\n", i + 1);
                 } else {
-                    if (ls) TcpSocketMgr::freeSocket(ls);
-                    printf("  COM%d: eager listen FAILED\n", i + 1);
+                    printf("  COM%d: listen socket pre-allocated\n", i + 1);
                 }
+            } else {
+                if (ls) TcpSocketMgr::freeSocket(ls);
+                printf("  COM%d: listen socket FAILED\n", i + 1);
             }
         }
-        /* Hunt groups */
-        for (i = 0; i < MAX_HUNT_GROUPS; i++) {
-            if (g_state.huntGroups[i].active &&
-                g_state.huntGroups[i].listenSock == NULL) {
-                TcpSocket *ls = TcpSocketMgr::getSocket();
-                if (ls && ls->listen(g_state.huntGroups[i].tcpPort, 2048) == 0) {
-                    int j;
-                    g_state.huntGroups[i].listenSock = ls;
-                    for (j = 0; j < MAX_PORTS; j++) {
-                        if (g_state.huntGroups[i].portMask & (1 << j))
+    }
+    /* Hunt groups */
+    for (i = 0; i < MAX_HUNT_GROUPS; i++) {
+        if (g_state.huntGroups[i].active &&
+            g_state.huntGroups[i].listenSock == NULL) {
+            TcpSocket *ls = TcpSocketMgr::getSocket();
+            if (ls && ls->listen(g_state.huntGroups[i].tcpPort, 16384) == 0) {
+                int j;
+                g_state.huntGroups[i].listenSock = ls;
+                for (j = 0; j < MAX_PORTS; j++) {
+                    if (g_state.huntGroups[i].portMask & (1 << j)) {
+                        if (eager_listen)
                             g_state.ports[j].mode = PORT_LISTEN;
                     }
-                    printf("  Hunt group %d: eager listen active\n", i);
-                } else {
-                    if (ls) TcpSocketMgr::freeSocket(ls);
-                    printf("  Hunt group %d: eager listen FAILED\n", i);
                 }
+                printf("  Hunt group %d: listen %s\n", i,
+                       eager_listen ? "active (eager)" : "pre-allocated");
+            } else {
+                if (ls) TcpSocketMgr::freeSocket(ls);
+                printf("  Hunt group %d: listen FAILED\n", i);
             }
         }
     }
@@ -699,16 +717,28 @@ int main(int argc, char *argv[])
     dbg("VMODEM loaded\n");
 
     /* Go TSR:
-     * paras = paragraphs from PSP to end of full DGROUP (including near heap).
-     * (DS - _psp) covers PSP + code segment + start of DGROUP.
-     * + 0x1000 = 4096 paragraphs = 64KB for the full DGROUP.
+     * In large model, malloc() allocates from the far heap which lives
+     * BEYOND the 64KB DGROUP.  We must keep all of that memory resident,
+     * PLUS reserve extra space for post-TSR allocations (listen sockets,
+     * recv buffers, etc.) that happen when the BBS calls FOSSIL init.
+     *
+     * Strategy: allocate a reserve block to grow the MCB, then free it.
+     * The freed block stays in the heap's free list.  After _dos_keep,
+     * the MCB is large enough to cover the reserve area, and post-TSR
+     * malloc() can reuse the freed blocks.
+     *
+     * Reserve: 8 sockets × (210 + 2048) ≈ 18 KB, round up to 32 KB.
      */
     {
-        unsigned short ds_seg = FP_SEG(&g_state);
-        unsigned short paras  = (unsigned short)(ds_seg - _psp) + 0x1000U;
-        printf("Resident size: %u bytes\n", (unsigned)(paras * 16u));
+        /* Read the MCB to find actual block size including far heap.
+         * All sockets and recv buffers are pre-allocated above, so the
+         * MCB covers everything we need. */
+        unsigned short mcb_paras =
+            *(unsigned short __far *)MK_FP(_psp - 1, 3);
+        printf("Resident size: %lu bytes (%u paragraphs)\n",
+               (unsigned long)mcb_paras * 16UL, mcb_paras);
         fflush(stdout);       /* _dos_keep() never returns — flush now */
-        _dos_keep(0, paras);  /* never returns */
+        _dos_keep(0, mcb_paras);  /* never returns */
     }
     return 0;
 }

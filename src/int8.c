@@ -123,7 +123,7 @@ void poll_on_priv_stack(void)
  * Stack switch and busy flag: identical to int28_handler.
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int1c_handler(void)
+void __interrupt __far __loadds int1c_handler(void)
 {
     _chain_intr(old_int1c);
 }
@@ -135,7 +135,7 @@ void __interrupt __far int1c_handler(void)
  * stack and chains to the previous INT 28h handler.
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int28_handler(void)
+void __interrupt __far __loadds int28_handler(void)
 {
     if (g_state.busy) {
         /* Already inside a poll — skip to avoid recursion */
@@ -180,7 +180,7 @@ void __interrupt __far int28_handler(void)
  *   [bp+4]  = ES (segment for MUX_STATUS buffer)
  * --------------------------------------------------------------------- */
 
-void __interrupt __far int2f_handler(void)
+void __interrupt __far __loadds int2f_handler(void)
 {
     unsigned short orig_ax;
     unsigned short orig_cx;
@@ -270,6 +270,11 @@ void __interrupt __far int2f_handler(void)
             poll_on_priv_stack();
             _disable();
             g_state.busy = 0;
+        } else {
+            /* Busy — can't do a full poll, but enable interrupts briefly
+             * so the packet driver IRQ can fire and process pending packets */
+            _enable();
+            _disable();
         }
         break;
 
@@ -337,7 +342,7 @@ void __interrupt __far int2f_handler(void)
             g_state.mux_sock_result = 0xFF;
             break;
         }
-        if (ns->setRecvBuffer(512) != 0) {
+        if (ns->setRecvBuffer(4096) != 0) {
             dbg("[ALLOC-NOMEM]");
             TcpSocketMgr::freeSocket(ns);
             g_state.mux_sock_result = 0xFF;
@@ -565,6 +570,143 @@ void __interrupt __far int2f_handler(void)
         }
 
         g_state.mux_sock_result = g_state.dns_resolve_state;
+        break;
+    }
+
+    case MUX_PORT_NAWS:
+    {
+        /* Return NAWS cols/rows for a COM port.
+         * CL = port index (0-3).  Returns DX = cols, SI = rows.
+         * If port invalid or NAWS not negotiated, returns 0,0. */
+        unsigned char port_idx;
+        unsigned short cols, rows;
+        port_idx = (unsigned char)(orig_cx & 0xFF);
+        cols = 0;
+        rows = 0;
+        if (port_idx < MAX_PORTS) {
+            cols = g_state.ports[port_idx].naws_cols;
+            rows = g_state.ports[port_idx].naws_rows;
+        }
+        __asm {
+            mov  ax, cols
+            mov  [bp+18], ax
+            mov  ax, rows
+            mov  [bp+10], ax
+        }
+        break;
+    }
+
+    case MUX_PORT_TTYPE:
+    {
+        /* Copy terminal type string for a COM port to caller's buffer.
+         * CL = port index (0-3), DX = buffer size, ES:BX -> destination.
+         * Returns AX = string length (0 if not available). */
+        unsigned char port_idx;
+        unsigned char __far *dst;
+        unsigned short bufsz;
+        unsigned short len;
+
+        port_idx = (unsigned char)(orig_cx & 0xFF);
+        dst = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        bufsz = (unsigned short)orig_dx;
+        len = 0;
+
+        if (port_idx < MAX_PORTS && bufsz > 0) {
+            const char *src = g_state.ports[port_idx].ttype;
+            while (src[len] && len < bufsz - 1) {
+                dst[len] = src[len];
+                len++;
+            }
+            dst[len] = '\0';
+        }
+        __asm {
+            mov  ax, len
+            mov  [bp+22], ax
+        }
+        break;
+    }
+
+    case MUX_SOCK_RECV_READY:
+    {
+        /* Check if a socket has data waiting to be read.
+         * CL = handle.  Returns 1 if data waiting, 0 otherwise. */
+        unsigned char handle = (unsigned char)(orig_cx & 0xFF);
+        unsigned short ready = 0;
+        if (handle < MAX_EXT_SOCKETS && g_state.ext_sockets[handle].sock != NULL) {
+            if (g_state.ext_sockets[handle].sock->recvDataWaiting())
+                ready = 1;
+        }
+        g_state.mux_sock_result = ready;
+        break;
+    }
+
+    case MUX_SOCK_DNS_FLUSH:
+    {
+        /* Flush a hostname from mTCP's DNS cache so the next resolve
+         * gets a fresh query.  ES:BX -> hostname string. */
+        unsigned char __far *src;
+        char name[64];
+        int i;
+        __asm {
+            mov  ax, [bp+4]
+            mov  word ptr src+2, ax
+            mov  ax, [bp+16]
+            mov  word ptr src, ax
+        }
+        for (i = 0; i < 63 && src[i] != 0; i++)
+            name[i] = src[i];
+        name[i] = '\0';
+        Dns::deleteFromCache(name);
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
+    /* ---- ICMP ping/traceroute API ---- */
+
+    case MUX_ICMP_SEND:
+    {
+        /* Send ICMP echo request.  CL=TTL, DX=seq, ES:BX->4-byte dest IP.
+         * Queues the request; actual send happens in do_mtcp_poll(). */
+        unsigned char __far *src;
+        src = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        g_state.icmp_ttl = (unsigned char)(orig_cx & 0xFF);
+        g_state.icmp_seq = (unsigned short)orig_dx;
+        g_state.icmp_dest_ip[0] = src[0];
+        g_state.icmp_dest_ip[1] = src[1];
+        g_state.icmp_dest_ip[2] = src[2];
+        g_state.icmp_dest_ip[3] = src[3];
+        g_state.icmp_send_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+        g_state.icmp_send_pending = 1;
+        g_state.icmp_state = ICMP_STATE_WAITING;
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
+    case MUX_ICMP_POLL:
+    {
+        /* Poll ICMP request state.  Returns ICMP_STATE_* via mux_sock_result.
+         * Also checks for timeout (~5 seconds = 91 BIOS ticks). */
+        if (g_state.icmp_state == ICMP_STATE_WAITING && !g_state.icmp_send_pending) {
+            unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            if (now - g_state.icmp_send_tick > 91UL)
+                g_state.icmp_state = ICMP_STATE_TIMEOUT;
+        }
+        g_state.mux_sock_result = g_state.icmp_state;
+        break;
+    }
+
+    case MUX_ICMP_RESULT:
+    {
+        /* Copy IcmpMuxResult to caller's buffer at ES:BX, then reset to IDLE. */
+        unsigned char __far *dst;
+        unsigned char *s;
+        int n;
+        dst = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        s = (unsigned char *)&g_state.icmp_result;
+        for (n = 0; n < (int)sizeof(IcmpMuxResult); n++)
+            dst[n] = s[n];
+        g_state.icmp_state = ICMP_STATE_IDLE;
+        g_state.mux_sock_result = 0;
         break;
     }
 

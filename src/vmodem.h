@@ -27,7 +27,7 @@
 
 #include "vmodem_mux.h"          /* StatusBlock, MUX_*, MAX_PORTS, etc. */
 
-#define RING_SIZE        512          /* rx ring buffer size (power-of-2!) */
+#define RING_SIZE        4096         /* rx ring buffer size (power-of-2!) */
 
 /* Maximum hunt groups (shared listen across multiple COM ports) */
 #define MAX_HUNT_GROUPS  2
@@ -36,6 +36,8 @@
 #define IAC_NORMAL       0   /* normal data mode */
 #define IAC_SAW_FF       1   /* received 0xFF (IAC), waiting for command */
 #define IAC_SAW_CMD      2   /* received command byte, waiting for option */
+#define IAC_IN_SB        3   /* inside subnegotiation (eating data) */
+#define IAC_SB_IAC       4   /* saw IAC inside subneg (waiting for SE) */
 
 /* Telnet protocol bytes */
 #define TEL_IAC          0xFF
@@ -47,8 +49,11 @@
 #define TEL_SE           0xF0   /* subnegotiation end   */
 
 /* Telnet option codes */
+#define TELOPT_BINARY    0x00   /* Binary Transmission (RFC 856) */
 #define TELOPT_ECHO      0x01
 #define TELOPT_SGA       0x03   /* Suppress Go Ahead */
+#define TELOPT_TTYPE     0x18   /* Terminal Type (24) */
+#define TELOPT_NAWS      0x1F   /* Negotiate About Window Size (31) */
 
 /* Private stack for INT 8h/28h handlers.  mTCP's TCP/ARP/packet processing
  * chain can easily consume 2-3 KB; 16 KB gives adequate headroom. */
@@ -104,8 +109,21 @@ typedef struct {
     unsigned char  iac_cmd;     /* the command byte we saw (WILL/WONT/DO/DONT) */
     unsigned char  neg_echo;    /* 1 = ECHO option negotiated */
     unsigned char  neg_sga;     /* 1 = SGA option negotiated  */
+    unsigned char  neg_binary;  /* 1 = BINARY option negotiated */
+    unsigned char  neg_naws;    /* 1 = NAWS option negotiated */
+    unsigned char  neg_ttype;   /* 1 = TTYPE option negotiated */
+    unsigned char  sb_opt;      /* subneg option code being received */
+    unsigned char  sb_buf[8];   /* subneg data accumulator */
+    unsigned char  sb_len;      /* bytes accumulated in sb_buf */
+    unsigned char  _pad_sb;     /* alignment pad for naws_cols */
+    unsigned short naws_cols;   /* terminal width (0 = unknown) */
+    unsigned short naws_rows;   /* terminal height (0 = unknown) */
+    char           ttype[41];   /* terminal type string from client */
+    unsigned char  iac_has_pending; /* 1 = iac_pending holds a byte to return */
+    unsigned char  iac_pending;    /* buffered byte from unescaped 0xFF in BINARY mode */
     unsigned char  pending_close;/* 1 = close socket on next poll cycle */
     unsigned char  dtr_ignore;  /* 1 = ignore DTR drops (&D0 mode) */
+    unsigned char  _pad_align;  /* alignment pad for conn_tick */
     unsigned long  conn_tick;   /* BIOS tick when connection entered PORT_CONN */
     unsigned long  last_rx_tick;/* BIOS tick when last TCP data was received */
     unsigned long  last_tx_tick;/* BIOS tick when last FOSSIL TX byte was sent */
@@ -185,6 +203,17 @@ typedef struct {
     unsigned char  dns_resolve_pad;
     char           dns_hostname[64];    /* hostname being resolved */
     IpAddr_t       dns_resolved_ip;     /* result IP address */
+
+    /* ICMP ping/traceroute state (one outstanding request at a time) */
+    unsigned char  icmp_state;          /* ICMP_STATE_* */
+    unsigned char  icmp_send_pending;   /* 1 = poll cycle should send echo request */
+    unsigned char  icmp_ttl;            /* TTL for outgoing echo */
+    unsigned char  icmp_pad0;
+    unsigned short icmp_seq;            /* sequence number */
+    unsigned short icmp_pad1;
+    IpAddr_t       icmp_dest_ip;        /* destination IP */
+    unsigned long  icmp_send_tick;      /* BIOS tick when sent */
+    IcmpMuxResult  icmp_result;         /* response details */
 } VModemState;
 
 /* StatusBlock is defined in vmodem_mux.h (shared with vmodctl, comdiag) */
@@ -228,16 +257,18 @@ void telnet_send_text(int port_idx, const char *msg);
 
 /* int14.c */
 extern "C" {
-    void __interrupt __far int14_real_handler(void);  /* FOSSIL INT 14h handler */
+    void __interrupt __far __loadds int14_real_handler(void);  /* FOSSIL INT 14h handler */
 }
 int fossil_is_init(int port_idx); /* 1 if AH=04h was called, 0 after AH=05h */
+extern unsigned char g_block_mode; /* 1 after first AH=18h block read */
+extern unsigned short g_diag_session; /* increments on each ZMODEM session */
 int fossil_flush_tx(int port_idx); /* drain TX ring to TCP socket */
 void fossil_clear_tx(int port_idx); /* discard any buffered TX data */
 
 /* int8.c */
-void __interrupt __far int1c_handler(void);
-void __interrupt __far int28_handler(void);
-void __interrupt __far int2f_handler(void);
+void __interrupt __far __loadds int1c_handler(void);
+void __interrupt __far __loadds int28_handler(void);
+void __interrupt __far __loadds int2f_handler(void);
 void do_mtcp_poll(void);
 void poll_on_priv_stack(void);
 
@@ -253,6 +284,39 @@ void at_set_ringing_silent(int port_idx);
 void at_set_cmd_mode(int port_idx);
 unsigned char at_is_connect_pending(int port_idx);
 void at_check_ring(int port_idx);
+
+/* Non-blocking socket teardown.
+ * Sends FIN (best-effort), pushes it out, and returns the socket to the
+ * free list.  Never blocks — safe to call from any context including
+ * INT 14h with IF=0.
+ *
+ * mTCP's close() is a blocking loop that spins on PACKET_PROCESS_SINGLE
+ * until the FIN-ACK arrives.  If the remote is gone and the timer tick
+ * interrupt can't fire (IF=0 in INT 14h context, or remote simply never
+ * responds), the loop never terminates and the system hangs. */
+/* Deferred close queue — sockets that have started a non-blocking close
+ * but need isCloseDone() called to complete cleanup (frees recv buffer,
+ * removes from active table).  Processed in the poll cycle. */
+#define MAX_CLOSING_SOCKETS 4
+extern TcpSocket *g_closing_sockets[MAX_CLOSING_SOCKETS];
+extern int g_closing_count;
+
+/* Start a non-blocking close and queue the socket for deferred cleanup.
+ * The poll cycle calls sock_close_drain() to finish the process. */
+static inline void sock_close_fast(TcpSocket *s)
+{
+    s->closeNonblocking();    /* sends FIN, returns immediately */
+    Tcp::drivePackets();      /* push the FIN out if possible */
+
+    /* Queue for deferred destroy+free via isCloseDone() in poll cycle */
+    if (g_closing_count < MAX_CLOSING_SOCKETS) {
+        g_closing_sockets[g_closing_count++] = s;
+    } else {
+        /* Queue full — last resort: free without destroy.
+         * This leaks the recv buffer but avoids a hang. */
+        TcpSocketMgr::freeSocket(s);
+    }
+}
 
 /* vmodem.c - control commands (callable from INT 2Fh handler) */
 void cmd_listen(int port_idx, unsigned short tcp_port);

@@ -13,7 +13,7 @@ VMODEM hooks INT 14h to present a standard FOSSIL driver interface (the same API
 - **FOSSIL-compatible** — drop-in replacement for a physical modem + FOSSIL driver
 - **Multi-port** — supports COM1–COM4 simultaneously
 - **Hunt groups** — multiple COM ports share a single TCP listen port; incoming connections are dispatched to the first free port (like a modem hunt group)
-- **Telnet IAC** — handles telnet protocol negotiation (WILL/WONT/DO/DONT, IAC escaping, NOP keepalives)
+- **Telnet IAC** — handles telnet protocol negotiation (WILL/WONT/DO/DONT, IAC escaping, NAWS window size, TTYPE terminal type, NOP keepalives)
 - **AT command emulation** — RING, auto-answer (S0 register), CONNECT/NO CARRIER responses
 - **Door support** — AT&D0 ignores DTR drops so BBS door programs can launch without losing the connection
 - **Outgoing TCP** — BSD socket API (`vsocket.lib`) lets DOS programs make outgoing TCP connections through the TSR
@@ -145,7 +145,7 @@ wmake install
 wmake clean
 ```
 
-All source files are compiled with `wpp` (C++ mode) to link against mTCP's C++ objects. Small memory model (`-ms`) is used to keep near pointers in DGROUP so the TSR stays compact after `_dos_keep()`.
+All source files are compiled with `wpp` (C++ mode) to link against mTCP's C++ objects. Large memory model (`-ml`) is used with the `-zu` flag (SS != DGROUP) so the far heap can use all available conventional memory beyond the 64 KB DGROUP segment.
 
 ### Linux Cross-Compilation Notes
 
@@ -205,6 +205,9 @@ python3 test_vmodem.py -l
 | `test_hunt_ring_timeout` | Hunt mode /E: ring timeout returns ports to LISTEN |
 | `test_tcp_out` | Outgoing TCP connection via MUX socket API |
 | `test_relay` | Bidirectional relay: FOSSIL incoming ↔ MUX socket outgoing |
+| `test_single_busy` | Single-port listen rejects second connection while busy |
+| `test_naws` | NAWS window size negotiation: telnet client sends 132×37, COMTEST verifies via MUX |
+| `test_ttype` | TTYPE terminal type negotiation: telnet client sends "ANSI", COMTEST verifies via MUX |
 
 Tests run inside DOSBox-X with slirp networking. The Python harness launches DOSBox-X, waits for VMODEM to start listening, connects via TCP, and communicates with `COMTEST.EXE` running inside the VM. Results are read from `COMTEST.LOG` written to a shared directory.
 
@@ -240,7 +243,7 @@ Tests run inside DOSBox-X with slirp networking. The Python harness launches DOS
 | **INT 28h** | DOS idle hook — drives mTCP polling (stack switch to private 16 KB stack) |
 | **INT 2Fh** | Multiplex — AH=C3h for runtime control (listen, connect, disconnect, status) |
 
-INT 28h is used for polling instead of INT 8 (timer tick) because mTCP already hooks INT 1Ch via INT 8. The private stack switch is necessary because the TSR's DGROUP stack is too small for mTCP's processing.
+INT 28h is used for polling instead of INT 8 (timer tick) because mTCP already hooks INT 1Ch via INT 8. The private stack switch is necessary because interrupt handlers run on the interrupted program's stack (SS != DGROUP in large model), and mTCP's processing needs a known-good stack in DGROUP.
 
 ### FOSSIL Interface
 
@@ -282,6 +285,10 @@ Runtime control and external socket API. Subcommands 00h–07h control the TSR; 
 | 16h | Sock result | Returns AX=last operation result |
 | 17h | DNS resolve | ES:BX→hostname; initiates async DNS query |
 | 18h | DNS result | ES:BX→4-byte IP buf; returns AL=state |
+| 19h | Port NAWS | CL=port(0–3); returns DX=cols, SI=rows |
+| 1Ah | Port TTYPE | CL=port(0–3), DX=bufsz, ES:BX→buf; returns AX=len |
+| 1Bh | Recv ready | CL=handle; returns AX=1 if data waiting |
+| 1Ch | DNS flush | ES:BX→hostname; flush DNS cache entry |
 | FFh | Unload | Restore vectors, free TSR memory |
 
 ### Port State Machine
@@ -308,11 +315,11 @@ VMODEM /L:1-4:2323    Four COM ports share TCP port 2323
 
 ### Memory Model
 
-Small model (`-ms`) with near data pointers. All mTCP buffers are allocated from `near malloc` to stay within the 64 KB DGROUP segment. The TSR footprint is kept minimal so `_dos_keep()` only reserves what's needed.
+Large model (`-ml`) with far code and data pointers. The `-zu` compiler flag is critical — it tells Watcom that SS may not equal DGROUP, preventing the compiler from generating `push ss; pop ds` to load DGROUP (which fails in interrupt handlers where SS belongs to the interrupted program). All interrupt handlers use `__loadds` to explicitly set DS=DGROUP. Listen sockets and receive buffers are pre-allocated before `_dos_keep()` since far heap `malloc()` cannot allocate new DOS memory blocks after the TSR is installed. The resident size is determined from the MCB (Memory Control Block) at PSP-1.
 
 ### mTCP Configuration
 
-Tuned for the 64 KB DGROUP constraint:
+Configuration:
 
 - 4 packet buffers
 - 8 TCP sockets (4 ports × 2: data + listen)
@@ -352,8 +359,80 @@ int main(void)
 - Max 4 simultaneous sockets
 - `gethostbyname()` supports DNS resolution and dotted-decimal IPs
 - `connect()` blocks with a 30-second timeout
+- `recv()` is non-blocking: returns bytes received, 0 if no data available, or -1 on error/remote close
 
 **This library is published in case it's useful to someone, but is not supported. Use at your own risk.**
+
+## TLS 1.2 Library (vtls.lib)
+
+A minimal TLS 1.2 client library for DOS. Performs a full TLS handshake over a vsocket TCP connection, providing encrypted communication with modern servers. Crypto primitives are derived from [PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/)/[ssh2dos](https://sourceforge.net/projects/azeret/) (AES, SHA-1, bignum RSA) with a new SHA-256 implementation for the TLS 1.2 PRF.
+
+**Cipher suite:** `TLS_RSA_WITH_AES_128_CBC_SHA` (0x002F) — RSA key exchange, AES-128-CBC encryption, HMAC-SHA1 integrity. This is the only suite supported.
+
+```c
+#include "vsocket.h"
+#include "vtls.h"
+
+int main(void)
+{
+    struct sockaddr_in addr;
+    char buf[256], cn[128];
+    int s, n;
+
+    if (vsock_init() != 0) return 1;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    /* ... set up addr ... */
+    connect(s, (struct sockaddr *)&addr, sizeof(addr));
+
+    /* TLS handshake (RSA key exchange, ~2-10 sec depending on key size) */
+    if (vtls_handshake(s) < 0) { /* error */ }
+
+    /* Peer certificate info */
+    vtls_peer_cn(s, cn, sizeof(cn));      /* e.g. "calcium.libera.chat" */
+    vtls_peer_key_bits(s);                 /* e.g. 4096 */
+
+    /* Send/receive over encrypted channel */
+    vtls_send(s, "NICK dos\r\n", 10);
+    n = vtls_recv(s, buf, sizeof(buf));
+
+    vtls_close(s);       /* close TLS session */
+    closesocket(s);      /* close TCP socket */
+    return 0;
+}
+```
+
+### API
+
+| Function | Description |
+|----------|-------------|
+| `vtls_handshake(sock)` | Perform TLS 1.2 handshake on a connected TCP socket. Returns 0 on success, -1 on failure. |
+| `vtls_send(sock, buf, len)` | Send data over TLS. Returns bytes sent or -1 on error. |
+| `vtls_recv(sock, buf, len)` | Receive data over TLS. Returns bytes received, 0 if none available, -1 on error/close. |
+| `vtls_peer_cn(sock, buf, buflen)` | Get the peer certificate Subject CN. Returns length or -1. |
+| `vtls_peer_key_bits(sock)` | Get the peer RSA key size in bits (e.g. 2048, 4096). Returns -1 if unavailable. |
+| `vtls_close(sock)` | Close the TLS session. Does **not** close the underlying TCP socket. |
+
+### Implementation Details
+
+- **Handshake:** ClientHello → ServerHello + Certificate + ServerHelloDone → ClientKeyExchange + ChangeCipherSpec + Finished → server ChangeCipherSpec + Finished
+- **RSA:** Bignum arithmetic with bit-at-a-time modular exponentiation. Supports 2048-bit and 4096-bit server keys. 4096-bit handshakes take ~10 seconds on a 486-class CPU.
+- **X.509:** Minimal ASN.1/DER parser — extracts the RSA public key (modulus + exponent) and Subject CN from the first certificate in the server's chain. No chain validation or CA trust store.
+- **Record layer:** TLS records are encrypted with AES-128-CBC and authenticated with HMAC-SHA1. Sequence numbers are tracked for replay protection.
+- **PRF:** TLS 1.2 PRF using HMAC-SHA256 (P_SHA256) for key derivation and Finished message computation.
+- **Memory:** Up to 4 simultaneous TLS connections. Per-connection state (AES contexts, MAC keys, receive buffer) uses ~3 KB in DGROUP plus a malloc'd application data buffer.
+- **No certificate verification** — the server's certificate is accepted unconditionally. This is a pragmatic choice for a DOS IRC client, not a security recommendation.
+
+### Limitations
+
+- RSA key exchange only (no DHE, ECDHE, or TLS 1.3)
+- Single cipher suite (`AES_128_CBC_SHA`)
+- No client certificates
+- No SNI (Server Name Indication)
+- No session resumption
+- No certificate chain validation
+
+**Tested against:** Libera.Chat IRC (4096-bit RSA), local test servers (2048-bit RSA).
 
 ## License
 

@@ -50,6 +50,9 @@
 /* BSD socket API wrapping VMODEM's MUX socket interface */
 #include "lib/vsocket.h"
 
+/* TLS 1.2 client */
+#include "vtls.h"
+
 /* Status word bits */
 #define STATUS_RDA       0x0100  /* AH bit 0: receive data available */
 #define STATUS_THRE      0x2000  /* AH bit 5: TX holding register empty */
@@ -134,6 +137,39 @@ static int fossil_rx(int port)
     unsigned short ax = fossil_call(FOSSIL_RX_CHAR, (unsigned short)port, 0);
     if (ax & 0x8000) return -1;  /* timeout / no data */
     return (int)(ax & 0xFF);
+}
+
+/* Block I/O: AH=18h (block read) and AH=19h (block write).
+ * These use ES:DI for the buffer pointer, which requires
+ * a separate int86x call with segment registers. */
+static unsigned short fossil_block_read(int port, unsigned char far *buf,
+                                        unsigned short max_chars)
+{
+    union REGS r;
+    struct SREGS sr;
+    r.h.ah = 0x18;
+    r.x.cx = max_chars;
+    r.x.dx = (unsigned short)port;
+    r.x.di = FP_OFF(buf);
+    sr.es  = FP_SEG(buf);
+    sr.ds  = FP_SEG(&logfile);  /* preserve DS */
+    int86x(0x14, &r, &r, &sr);
+    return r.x.ax;  /* actual chars read */
+}
+
+static unsigned short fossil_block_write(int port, unsigned char far *buf,
+                                         unsigned short max_chars)
+{
+    union REGS r;
+    struct SREGS sr;
+    r.h.ah = 0x19;
+    r.x.cx = max_chars;
+    r.x.dx = (unsigned short)port;
+    r.x.di = FP_OFF(buf);
+    sr.es  = FP_SEG(buf);
+    sr.ds  = FP_SEG(&logfile);  /* preserve DS */
+    int86x(0x14, &r, &r, &sr);
+    return r.x.ax;  /* actual chars written */
 }
 
 static void fossil_tx_string(int port, const char *s)
@@ -312,6 +348,78 @@ static void test_echo(void)
         log_result("ECHO_DISCONNECT", 1, "(DCD dropped)");
     } else {
         log_result("ECHO_DISCONNECT", 0, "(still connected after 15s)");
+    }
+
+    fossil_deinit(0);
+}
+
+static void test_block_echo(void)
+{
+    /* Echo test using AH=18h/19h block I/O — same as real BBS software. */
+    unsigned long deadline;
+    int got_data = 0;
+    char first_bytes[128];
+    int first_len = 0;
+    unsigned long total_rx = 0;
+    unsigned long total_tx = 0;
+
+    fossil_init_answer(0);
+    log_info("BLOCK_ECHO: waiting for DCD (connection)...");
+    write_ready_flag("ECHO_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 120)) {
+        log_result("BLOCK_ECHO_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("BLOCK_ECHO_DCD", 1, "(connection detected)");
+
+    log_info("BLOCK_ECHO: reading/echoing data via AH=18h/19h...");
+    deadline = get_tick() + 10UL * 18UL;
+    while (get_tick() < deadline) {
+        unsigned char blk[256];
+        unsigned short n;
+        unsigned short st;
+
+        st = fossil_status(0);
+        if (!(st & STATUS_DCD)) break;
+
+        n = fossil_block_read(0, (unsigned char far *)blk, sizeof(blk));
+        if (n > 0) {
+            unsigned short w;
+            got_data = 1;
+            total_rx += n;
+
+            /* Save first bytes for log */
+            if (first_len < 127) {
+                int copy = (int)n;
+                if (first_len + copy > 127) copy = 127 - first_len;
+                memcpy(first_bytes + first_len, blk, copy);
+                first_len += copy;
+            }
+
+            /* Echo back via block write */
+            w = fossil_block_write(0, (unsigned char far *)blk, n);
+            total_tx += w;
+
+            /* Reset deadline on data */
+            deadline = get_tick() + 3UL * 18UL;
+        }
+    }
+    first_bytes[first_len] = '\0';
+
+    {
+        char detail[80];
+        sprintf(detail, "(rx=%lu tx=%lu)", total_rx, total_tx);
+        log_result("BLOCK_ECHO_DATA", got_data, detail);
+    }
+
+    /* Wait for disconnect */
+    log_info("BLOCK_ECHO: waiting for disconnect...");
+    if (wait_for_no_dcd(0, 30)) {
+        log_result("BLOCK_ECHO_DISCONNECT", 1, "(DCD dropped)");
+    } else {
+        log_result("BLOCK_ECHO_DISCONNECT", 0, "(still connected after 30s)");
     }
 
     fossil_deinit(0);
@@ -550,6 +658,8 @@ static void test_idle_timeout(void)
     unsigned char mode;
 
     fossil_init_answer(0);
+    /* Idle timeout is disabled by default; enable it via S30 register */
+    fossil_tx_string(0, "ATS30=30\r");
     log_info("IDLE_TIMEOUT: waiting for connection...");
     write_ready_flag("IDLE_WAITING_DCD");
 
@@ -1259,6 +1369,562 @@ static void test_relay(unsigned char ip0, unsigned char ip1,
         write_ready_flag("RELAY_FAIL");
 }
 
+/* ---- NAWS query test ---- */
+
+static void test_naws_query(void)
+{
+    /* Init FOSSIL, wait for connection (Python sends NAWS),
+     * then query NAWS via MUX_PORT_NAWS and report results. */
+    union REGS r;
+    unsigned short cols, rows;
+
+    fossil_init_answer(0);
+    log_info("NAWS_QUERY: waiting for connection...");
+    write_ready_flag("NAWS_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 60)) {
+        log_result("NAWS_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("NAWS_DCD", 1, "(connected)");
+
+    /* Give VMODEM time to complete IAC negotiation + receive NAWS subneg */
+    {
+        unsigned long deadline = get_tick() + 36;  /* ~2 seconds */
+        while (get_tick() < deadline)
+            dos_idle();
+    }
+
+    /* Query NAWS via MUX_PORT_NAWS (0x19) */
+    memset(&r, 0, sizeof(r));
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_PORT_NAWS;
+    r.h.cl = 0;  /* COM1 */
+    int86(0x2F, &r, &r);
+    cols = r.x.dx;
+    rows = r.x.si;
+
+    {
+        char buf[80];
+        sprintf(buf, "(cols=%u rows=%u)", cols, rows);
+        log_result("NAWS_NONZERO", cols > 0 && rows > 0, buf);
+        log_result("NAWS_COLS", cols == 132, buf);
+        log_result("NAWS_ROWS", rows == 37, buf);
+    }
+
+    /* Signal Python to disconnect */
+    write_ready_flag("NAWS_DONE");
+
+    if (wait_for_no_dcd(0, 30))
+        log_result("NAWS_DISC", 1, "(disconnected)");
+    else
+        log_result("NAWS_DISC", 0, "(still connected)");
+
+    fossil_deinit(0);
+}
+
+static void test_ttype_query(void)
+{
+    /* Init FOSSIL, wait for connection (Python sends TTYPE),
+     * then query TTYPE via MUX_PORT_TTYPE and report results. */
+    union REGS r;
+    struct SREGS sr;
+    char ttype_buf[42];
+
+    fossil_init_answer(0);
+    log_info("TTYPE_QUERY: waiting for connection...");
+    write_ready_flag("TTYPE_WAITING_DCD");
+
+    if (!wait_for_dcd(0, 60)) {
+        log_result("TTYPE_DCD", 0, "(timeout waiting for connection)");
+        fossil_deinit(0);
+        return;
+    }
+    log_result("TTYPE_DCD", 1, "(connected)");
+
+    /* Give VMODEM time to complete IAC negotiation + receive TTYPE subneg */
+    {
+        unsigned long deadline = get_tick() + 36;  /* ~2 seconds */
+        while (get_tick() < deadline)
+            dos_idle();
+    }
+
+    /* Query TTYPE via MUX_PORT_TTYPE (0x1A) */
+    memset(ttype_buf, 0, sizeof(ttype_buf));
+    memset(&r, 0, sizeof(r));
+    memset(&sr, 0, sizeof(sr));
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_PORT_TTYPE;
+    r.h.cl = 0;  /* COM1 */
+    r.x.dx = sizeof(ttype_buf);
+    sr.es = FP_SEG(ttype_buf);
+    r.x.bx = FP_OFF(ttype_buf);
+    int86x(0x2F, &r, &r, &sr);
+
+    {
+        char buf[80];
+        sprintf(buf, "(ttype=\"%s\" len=%u)", ttype_buf, r.x.ax);
+        log_result("TTYPE_NONZERO", ttype_buf[0] != '\0', buf);
+        log_result("TTYPE_VALUE", strcmp(ttype_buf, "ANSI") == 0, buf);
+    }
+
+    /* Signal Python to disconnect */
+    write_ready_flag("TTYPE_DONE");
+
+    if (wait_for_no_dcd(0, 30))
+        log_result("TTYPE_DISC", 1, "(disconnected)");
+    else
+        log_result("TTYPE_DISC", 0, "(still connected)");
+
+    fossil_deinit(0);
+}
+
+/* ---- ZMODEM protocol ---- */
+
+/* ZMODEM constants */
+#define ZM_ZPAD     0x2A  /* '*' */
+#define ZM_ZDLE     0x18
+#define ZM_ZHEX     0x42  /* 'B' */
+
+/* Frame types */
+#define ZM_ZRQINIT  0
+#define ZM_ZRINIT   1
+#define ZM_ZFILE    4
+#define ZM_ZFIN     8
+#define ZM_ZRPOS    9
+#define ZM_ZDATA    10
+#define ZM_ZEOF     11
+
+/* Subpacket end types */
+#define ZM_ZCRCE    0x68  /* frame ends, header follows */
+#define ZM_ZCRCW    0x6B  /* frame ends, wait for response */
+
+/* CRC-16 CCITT */
+static unsigned short zm_crc_tab[256];
+
+static void zm_crc_init(void)
+{
+    int i, j;
+    for (i = 0; i < 256; i++) {
+        unsigned short crc = (unsigned short)(i << 8);
+        for (j = 0; j < 8; j++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
+        zm_crc_tab[i] = crc;
+    }
+}
+
+static unsigned short zm_crc_upd(unsigned short crc, unsigned char b)
+{
+    return (unsigned short)((crc << 8) ^ zm_crc_tab[((crc >> 8) ^ b) & 0xFF]);
+}
+
+static int zm_needs_escape(unsigned char b)
+{
+    switch (b) {
+    case 0x18: case 0x10: case 0x11: case 0x13:
+    case 0x90: case 0x91: case 0x93: case 0xFF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void zm_tx_escaped(int port, unsigned char b)
+{
+    if (zm_needs_escape(b)) {
+        fossil_tx(port, ZM_ZDLE);
+        fossil_tx(port, (unsigned char)(b ^ 0x40));
+    } else {
+        fossil_tx(port, b);
+    }
+}
+
+static void zm_flush(int port)
+{
+    fossil_call(FOSSIL_FLUSH_OUT, (unsigned short)port, 0);
+    fossil_status(port);
+}
+
+static void zm_send_hex_hdr(int port, unsigned char type, unsigned long pos)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char hdr[5];
+    unsigned short crc;
+    int i;
+
+    hdr[0] = type;
+    hdr[1] = (unsigned char)(pos & 0xFF);
+    hdr[2] = (unsigned char)((pos >> 8) & 0xFF);
+    hdr[3] = (unsigned char)((pos >> 16) & 0xFF);
+    hdr[4] = (unsigned char)((pos >> 24) & 0xFF);
+
+    crc = 0;
+    for (i = 0; i < 5; i++)
+        crc = zm_crc_upd(crc, hdr[i]);
+    crc = zm_crc_upd(zm_crc_upd(crc, 0), 0);
+
+    fossil_tx(port, ZM_ZPAD);
+    fossil_tx(port, ZM_ZPAD);
+    fossil_tx(port, ZM_ZDLE);
+    fossil_tx(port, ZM_ZHEX);
+
+    for (i = 0; i < 5; i++) {
+        fossil_tx(port, (unsigned char)hex[hdr[i] >> 4]);
+        fossil_tx(port, (unsigned char)hex[hdr[i] & 0x0F]);
+    }
+
+    fossil_tx(port, (unsigned char)hex[(crc >> 12) & 0x0F]);
+    fossil_tx(port, (unsigned char)hex[(crc >> 8) & 0x0F]);
+    fossil_tx(port, (unsigned char)hex[(crc >> 4) & 0x0F]);
+    fossil_tx(port, (unsigned char)hex[crc & 0x0F]);
+
+    fossil_tx(port, '\r');
+    fossil_tx(port, '\n');
+
+    if (type != ZM_ZFIN)
+        fossil_tx(port, 0x11);  /* XON */
+}
+
+static void zm_send_data(int port, const unsigned char *data, int len,
+                         unsigned char frameend)
+{
+    unsigned short crc = 0;
+    int i;
+
+    for (i = 0; i < len; i++) {
+        crc = zm_crc_upd(crc, data[i]);
+        zm_tx_escaped(port, data[i]);
+    }
+
+    crc = zm_crc_upd(crc, frameend);
+    fossil_tx(port, ZM_ZDLE);
+    fossil_tx(port, frameend);
+
+    crc = zm_crc_upd(zm_crc_upd(crc, 0), 0);
+    zm_tx_escaped(port, (unsigned char)(crc >> 8));
+    zm_tx_escaped(port, (unsigned char)(crc & 0xFF));
+}
+
+/* Receive a hex header from the remote.  Returns frame type or -1. */
+static int zm_recv_hex_hdr(int port, unsigned long *pos, int timeout_secs)
+{
+    unsigned long deadline = get_tick() + (unsigned long)timeout_secs * 18UL;
+    int state = 0;
+    char hexbuf[14];
+    int hi = 0;
+    unsigned char hdr[5];
+    unsigned short crc_recv, crc_calc;
+    int i, b;
+
+    while (get_tick() < deadline) {
+        unsigned short st = fossil_status(port);
+        if (!(st & STATUS_RDA)) { dos_idle(); continue; }
+        b = fossil_rx(port);
+        if (b < 0) continue;
+
+        switch (state) {
+        case 0:
+            if (b == ZM_ZPAD) state = 1;
+            break;
+        case 1:
+            if (b == ZM_ZPAD) state = 1;
+            else if (b == ZM_ZDLE) state = 2;
+            else state = 0;
+            break;
+        case 2:
+            if (b == ZM_ZHEX) { state = 3; hi = 0; }
+            else state = 0;
+            break;
+        case 3:
+            if ((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') ||
+                (b >= 'A' && b <= 'F')) {
+                hexbuf[hi++] = (char)b;
+                if (hi == 14) goto got_header;
+            } else if (b == '\r' || b == '\n' || b == 0x11) {
+                /* skip trailer bytes */
+            } else {
+                state = 0;
+            }
+            break;
+        }
+    }
+    return -1;
+
+got_header:
+    for (i = 0; i < 5; i++) {
+        unsigned char hn, ln;
+        char ch = hexbuf[i*2], cl = hexbuf[i*2+1];
+        hn = (ch >= 'a') ? (unsigned char)(ch - 'a' + 10)
+           : (ch >= 'A') ? (unsigned char)(ch - 'A' + 10)
+           : (unsigned char)(ch - '0');
+        ln = (cl >= 'a') ? (unsigned char)(cl - 'a' + 10)
+           : (cl >= 'A') ? (unsigned char)(cl - 'A' + 10)
+           : (unsigned char)(cl - '0');
+        hdr[i] = (hn << 4) | ln;
+    }
+
+    {
+        unsigned char c[4];
+        int ci;
+        for (ci = 0; ci < 4; ci++) {
+            char ch = hexbuf[10 + ci];
+            c[ci] = (ch >= 'a') ? (unsigned char)(ch - 'a' + 10)
+                  : (ch >= 'A') ? (unsigned char)(ch - 'A' + 10)
+                  : (unsigned char)(ch - '0');
+        }
+        crc_recv = (unsigned short)((c[0] << 12) | (c[1] << 8) |
+                                    (c[2] << 4) | c[3]);
+    }
+
+    crc_calc = 0;
+    for (i = 0; i < 5; i++)
+        crc_calc = zm_crc_upd(crc_calc, hdr[i]);
+    crc_calc = zm_crc_upd(zm_crc_upd(crc_calc, 0), 0);
+
+    if (crc_calc != crc_recv) return -2;
+
+    *pos = (unsigned long)hdr[1] | ((unsigned long)hdr[2] << 8) |
+           ((unsigned long)hdr[3] << 16) | ((unsigned long)hdr[4] << 24);
+    return (int)hdr[0];
+}
+
+/* ZMODEM_SEND test: send a test file via ZMODEM through FOSSIL */
+static void test_zmodem_send(void)
+{
+    /* 256-byte binary test file: every byte value 0x00-0xFF.
+     * Exercises all ZDLE-escape edge cases (0x00, 0x10, 0x11, 0x13,
+     * 0x18/ZDLE, 0x90, 0x91, 0x93, 0xFF/IAC) and telnet transparency. */
+    static unsigned char test_data[256];
+    static const char filename[] = "TEST.BIN";
+    int data_len = 256;
+    static int data_init = 0;
+    if (!data_init) {
+        int bi;
+        for (bi = 0; bi < 256; bi++)
+            test_data[bi] = (unsigned char)bi;
+        data_init = 1;
+    }
+    unsigned long pos;
+    int type;
+    int port = 0;
+
+    zm_crc_init();
+
+    fossil_init_answer(port);
+    log_info("ZMODEM_SEND: waiting for DCD...");
+    write_ready_flag("ZMODEM_WAITING_DCD");
+
+    if (!wait_for_dcd(port, 120)) {
+        log_result("ZMODEM_DCD", 0, "(timeout)");
+        fossil_deinit(port);
+        return;
+    }
+    log_result("ZMODEM_DCD", 1, "(connected)");
+
+    /* Let connection stabilize */
+    {
+        unsigned long t = get_tick() + 18UL;
+        while (get_tick() < t) dos_idle();
+    }
+
+    /* 1. Autostart + ZRQINIT */
+    fossil_tx_string(port, "rz\r");
+    zm_send_hex_hdr(port, ZM_ZRQINIT, 0);
+    zm_flush(port);
+    log_info("ZMODEM_SEND: sent ZRQINIT");
+
+    /* 2. Wait for ZRINIT */
+    type = zm_recv_hex_hdr(port, &pos, 30);
+    if (type != ZM_ZRINIT) {
+        char buf[40];
+        sprintf(buf, "(expected ZRINIT=%d, got %d)", ZM_ZRINIT, type);
+        log_result("ZMODEM_ZRINIT", 0, buf);
+        fossil_deinit(port);
+        return;
+    }
+    log_result("ZMODEM_ZRINIT", 1, "(received)");
+
+    /* 3. ZFILE + file info subpacket */
+    zm_send_hex_hdr(port, ZM_ZFILE, 0);
+    {
+        char fileinfo[64];
+        int fi_pos;
+        strcpy(fileinfo, filename);
+        fi_pos = (int)strlen(filename) + 1;
+        sprintf(fileinfo + fi_pos, "%d ", data_len);
+        fi_pos += (int)strlen(fileinfo + fi_pos) + 1;
+        zm_send_data(port, (const unsigned char *)fileinfo, fi_pos, ZM_ZCRCW);
+    }
+    zm_flush(port);
+    log_info("ZMODEM_SEND: sent ZFILE");
+
+    /* 4. Wait for ZRPOS */
+    type = zm_recv_hex_hdr(port, &pos, 30);
+    if (type != ZM_ZRPOS) {
+        char buf[40];
+        sprintf(buf, "(expected ZRPOS=%d, got %d)", ZM_ZRPOS, type);
+        log_result("ZMODEM_ZRPOS", 0, buf);
+        fossil_deinit(port);
+        return;
+    }
+    log_result("ZMODEM_ZRPOS", 1, "(received)");
+
+    /* 5. ZDATA + file data */
+    zm_send_hex_hdr(port, ZM_ZDATA, 0);
+    zm_send_data(port, (const unsigned char *)test_data, data_len, ZM_ZCRCE);
+    zm_flush(port);
+    log_info("ZMODEM_SEND: sent file data");
+
+    /* 6. ZEOF */
+    zm_send_hex_hdr(port, ZM_ZEOF, (unsigned long)data_len);
+    zm_flush(port);
+    log_info("ZMODEM_SEND: sent ZEOF");
+
+    /* 7. Wait for ZRINIT (ready for next file) */
+    type = zm_recv_hex_hdr(port, &pos, 30);
+    if (type != ZM_ZRINIT) {
+        char buf[40];
+        sprintf(buf, "(expected ZRINIT, got %d)", type);
+        log_result("ZMODEM_FINAL_ZRINIT", 0, buf);
+    } else {
+        log_result("ZMODEM_FINAL_ZRINIT", 1, "(received)");
+    }
+
+    /* 8. ZFIN */
+    zm_send_hex_hdr(port, ZM_ZFIN, 0);
+    zm_flush(port);
+
+    /* 9. Wait for ZFIN */
+    type = zm_recv_hex_hdr(port, &pos, 20);
+    log_result("ZMODEM_ZFIN", type == ZM_ZFIN,
+               type == ZM_ZFIN ? "(received)" : "(timeout or wrong)");
+
+    /* 10. Over and Out */
+    fossil_tx(port, 'O');
+    fossil_tx(port, 'O');
+    zm_flush(port);
+
+    log_result("ZMODEM_SEND", 1, "file sent successfully");
+    write_ready_flag("ZMODEM_PASS");
+
+    /* Keep alive for TCP delivery */
+    {
+        unsigned long t = get_tick() + 36UL;
+        while (get_tick() < t) { fossil_status(port); dos_idle(); }
+    }
+
+    fossil_deinit(port);
+}
+
+/* ---- TLS IRC test ---- */
+static void test_tls_irc(const char *hostname, unsigned short port)
+{
+    struct hostent *he;
+    struct sockaddr_in sa;
+    int sock, n;
+    char buf[512];
+
+    printf("TLS IRC test: %s:%u\n", hostname, port);
+
+    if (vsock_init() < 0) {
+        log_result("TLS_IRC", 0, "vsock_init failed");
+        return;
+    }
+    log_result("TLS_IRC", 1, "vsock_init");
+
+    printf("Resolving %s...\n", hostname);
+    he = gethostbyname(hostname);
+    if (!he) {
+        log_result("TLS_IRC", 0, "DNS resolve failed");
+        return;
+    }
+    log_result("TLS_IRC", 1, "DNS resolve");
+
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        log_result("TLS_IRC", 0, "socket failed");
+        return;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    memcpy(&sa.sin_addr, he->h_addr, 4);
+
+    printf("Connecting...\n");
+    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        log_result("TLS_IRC", 0, "connect failed");
+        closesocket(sock);
+        return;
+    }
+    log_result("TLS_IRC", 1, "TCP connect");
+
+    printf("TLS handshake...\n");
+    if (vtls_handshake(sock) < 0) {
+        log_result("TLS_IRC", 0, "TLS handshake failed");
+        closesocket(sock);
+        return;
+    }
+    log_result("TLS_IRC", 1, "TLS handshake");
+
+    /* Show peer certificate CN */
+    {
+        char cn[128];
+        if (vtls_peer_cn(sock, cn, sizeof(cn)) > 0) {
+            printf("Peer CN: %s\n", cn);
+            log_result("TLS_IRC", 1, cn);
+        }
+    }
+
+    /* Send IRC NICK and USER */
+    {
+        const char *nick_cmd = "NICK vtlstest\r\n";
+        const char *user_cmd = "USER vtlstest 0 * :vtls test\r\n";
+        vtls_send(sock, nick_cmd, (int)strlen(nick_cmd));
+        vtls_send(sock, user_cmd, (int)strlen(user_cmd));
+    }
+
+    /* Read some IRC server responses */
+    printf("Reading IRC responses...\n");
+    {
+        int total = 0;
+        unsigned long timeout = get_tick() + 182; /* ~10 seconds */
+        while (total < (int)sizeof(buf) - 1 && get_tick() < timeout) {
+            vsock_poll();
+            n = vtls_recv(sock, buf + total, (int)sizeof(buf) - 1 - total);
+            if (n > 0) {
+                total += n;
+                buf[total] = '\0';
+                if (strstr(buf, "\r\n")) break;
+            } else if (n < 0) {
+                break;
+            }
+        }
+        buf[total] = '\0';
+        if (total > 0) {
+            printf("Got %d bytes: %.60s...\n", total, buf);
+            log_result("TLS_IRC", 1, "recv data");
+        } else {
+            log_result("TLS_IRC", 0, "no data received");
+        }
+    }
+
+    /* Send QUIT */
+    {
+        const char *quit = "QUIT :bye\r\n";
+        vtls_send(sock, quit, (int)strlen(quit));
+    }
+
+    vtls_close(sock);
+    closesocket(sock);
+    log_result("TLS_IRC", 1, "close");
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char *argv[])
@@ -1344,6 +2010,19 @@ int main(int argc, char *argv[])
         else if (strcmp(upper, "DNS_RESOLVE") == 0) {
             const char *host = argc > 2 ? argv[2] : "one.one.one.one";
             test_dns_resolve(host);
+        }
+        else if (strcmp(upper, "NAWS_QUERY") == 0)
+            test_naws_query();
+        else if (strcmp(upper, "TTYPE_QUERY") == 0)
+            test_ttype_query();
+        else if (strcmp(upper, "BLOCK_ECHO") == 0)
+            test_block_echo();
+        else if (strcmp(upper, "ZMODEM_SEND") == 0)
+            test_zmodem_send();
+        else if (strcmp(upper, "TLS_IRC") == 0) {
+            const char *host = argc > 2 ? argv[2] : "irc.libera.chat";
+            unsigned short port = argc > 3 ? (unsigned short)atoi(argv[3]) : 6697;
+            test_tls_irc(host, port);
         }
         else {
             printf("Unknown test: %s\n", upper);

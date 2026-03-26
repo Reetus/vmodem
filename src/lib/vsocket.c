@@ -28,7 +28,7 @@ static unsigned char vsock_allocated[MAX_VSOCK];
  * The MUX handler reads/writes via ES:BX where ES=DS (DGROUP).
  * In large model, caller buffers may be in other segments, so we
  * copy through this near buffer. */
-static unsigned char mux_staging[256];
+static unsigned char mux_staging[1024];
 
 /* ---- Static storage for gethostbyname ---- */
 static struct hostent  s_hostent;
@@ -83,8 +83,8 @@ static int mux_sock_connect(int handle, unsigned char *ip,
     mux_staging[2] = ip[2]; mux_staging[3] = ip[3];
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_CONNECT
         mov  cl, h
@@ -116,8 +116,8 @@ static int mux_sock_send(int handle, unsigned char *data,
     (void)data;  /* caller must pre-fill mux_staging[] */
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP (mux_staging is in DGROUP) */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_SEND
         mov  cl, h
@@ -138,8 +138,8 @@ static int mux_sock_recv(int handle, unsigned char *buf,
     (void)buf;  /* caller must read mux_staging[] after call */
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RECV
         mov  cl, h
@@ -325,7 +325,7 @@ int send(int sockfd, const void *buf, int len, int flags)
         int n, i;
 
         chunk = (unsigned short)(len - total);
-        if (chunk > 256) chunk = 256;
+        if (chunk > 1024) chunk = 1024;
 
         /* Copy caller's buffer to DGROUP staging (required for large model
          * where caller data may be in a different segment) */
@@ -346,8 +346,13 @@ int send(int sockfd, const void *buf, int len, int flags)
             mux_poll_internal();
             retries++;
             if (retries > 200) {
-                vsock_errno = VSOCK_ETIMEDOUT;
-                return total > 0 ? total : -1;
+                /* Switch to slower polling — yield CPU between attempts
+                 * so the system stays responsive */
+                dos_idle();
+                if (retries > 2000) {
+                    vsock_errno = VSOCK_ETIMEDOUT;
+                    return total > 0 ? total : -1;
+                }
             }
         }
     }
@@ -385,8 +390,10 @@ int recv(int sockfd, void *buf, int len, int flags)
     /* Check for EOF / remote close */
     {
         int st = mux_sock_status(h);
-        if (st == EXT_SOCK_REMOTE_CLOSED || st == EXT_SOCK_ERROR)
-            return 0;      /* EOF */
+        if (st == EXT_SOCK_REMOTE_CLOSED || st == EXT_SOCK_ERROR) {
+            vsock_errno = 1;
+            return -1;     /* remote closed */
+        }
     }
 
     return 0;   /* no data available */
@@ -402,6 +409,29 @@ int closesocket(int sockfd)
     mux_sock_close_internal(h);
     vsock_allocated[h] = 0;
     return 0;
+}
+
+int vsock_data_ready(int sockfd)
+{
+    int h;
+    unsigned short result;
+
+    h = fd_to_handle(sockfd);
+    if (h < 0) return 0;
+
+    mux_poll_internal();
+
+    {
+        unsigned char hb = (unsigned char)h;
+        __asm {
+            mov  ah, MUX_ID
+            mov  al, MUX_SOCK_RECV_READY
+            mov  cl, hb
+            int  2Fh
+        }
+    }
+    result = mux_get_result();
+    return (int)result;
 }
 
 /* -----------------------------------------------------------------------
@@ -453,8 +483,8 @@ static int mux_resolve_start(const char *hostname)
     (void)hostname;
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RESOLVE
         lea  bx, s_hostname
@@ -471,8 +501,8 @@ static int mux_resolve_result(unsigned char *ip_buf)
     (void)ip_buf;
     __asm {
         push es
-        push ds
-        pop  es
+        push ss
+        pop  es          /* ES = SS = DGROUP */
         mov  ah, MUX_ID
         mov  al, MUX_SOCK_RESOLVE_RESULT
         lea  bx, mux_staging
@@ -487,6 +517,26 @@ static int mux_resolve_result(unsigned char *ip_buf)
         ip_buf[3] = mux_staging[3];
     }
     return state;
+}
+
+void vsock_dns_flush(const char *hostname)
+{
+    /* Copy hostname to DGROUP, then call MUX to flush DNS cache entry */
+    int i;
+    for (i = 0; i < 63 && hostname[i]; i++)
+        s_hostname[i] = hostname[i];
+    s_hostname[i] = '\0';
+
+    __asm {
+        push es
+        push ss
+        pop  es
+        mov  ah, MUX_ID
+        mov  al, MUX_SOCK_DNS_FLUSH
+        lea  bx, s_hostname
+        int  2Fh
+        pop  es
+    }
 }
 
 static void fill_hostent(const char *name, in_addr_t addr)
@@ -574,4 +624,62 @@ struct hostent *gethostbyname(const char *name)
 
     h_errno = HOST_NOT_FOUND;
     return (struct hostent *)0;
+}
+
+/* -----------------------------------------------------------------------
+ * ICMP ping/traceroute API
+ * ----------------------------------------------------------------------- */
+
+int vsock_icmp_send(unsigned char *dest_ip, unsigned char ttl, unsigned short seq)
+{
+    union REGS r;
+    struct SREGS sr;
+
+    /* Copy dest IP to DGROUP staging buffer */
+    mux_staging[0] = dest_ip[0];
+    mux_staging[1] = dest_ip[1];
+    mux_staging[2] = dest_ip[2];
+    mux_staging[3] = dest_ip[3];
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_SEND;
+    r.h.cl = ttl;
+    r.x.dx = seq;
+    r.x.bx = (unsigned short)(void __near *)mux_staging;
+    segread(&sr);
+    sr.es = sr.ds;
+    int86x(0x2F, &r, &r, &sr);
+
+    return 0;
+}
+
+int vsock_icmp_poll(void)
+{
+    union REGS r;
+
+    /* Drive a poll cycle so the TSR can send/receive packets */
+    mux_poll_internal();
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_POLL;
+    int86(0x2F, &r, &r);
+
+    /* Retrieve result via MUX_SOCK_RESULT */
+    return (int)mux_get_result();
+}
+
+int vsock_icmp_result(IcmpMuxResult *result)
+{
+    union REGS r;
+    struct SREGS sr;
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_RESULT;
+    r.x.bx = (unsigned short)(void __near *)mux_staging;
+    segread(&sr);
+    sr.es = sr.ds;
+    int86x(0x2F, &r, &r, &sr);
+
+    memcpy(result, mux_staging, sizeof(IcmpMuxResult));
+    return 0;
 }

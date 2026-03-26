@@ -240,9 +240,7 @@ void at_check_ring(int port_idx)
         telnet_send_text(port_idx, "\r\nThe host didn't answer :(\r\n");
         Tcp::drivePackets();
         if (p->sock) {
-            p->sock->close();
-            Tcp::drivePackets();
-            TcpSocketMgr::freeSocket(p->sock);
+            sock_close_fast(p->sock);
             p->sock = NULL;
         }
         ring_init(&p->rx);
@@ -421,18 +419,13 @@ static void at_execute(int port_idx)
                 break;
             }
             if (p->mode == PORT_CONN && p->sock != NULL) {
-                /* Answered call — disconnect */
+                /* Answered call — defer disconnect to poll cycle.
+                 * We're in INT 14h context (IF=0); calling close() here
+                 * hangs forever if the remote is gone because mTCP's
+                 * timeout relies on timer ticks that can't fire with
+                 * interrupts disabled. */
                 fossil_flush_tx(port_idx);
-                p->sock->close();
-                TcpSocketMgr::freeSocket(p->sock);
-                p->sock = NULL;
-                ring_init(&p->rx);
-                if (p->listenSock)
-                    p->mode = PORT_LISTEN;
-                else if (p->huntGroupIdx >= 0)
-                    p->mode = PORT_LISTEN;
-                else
-                    p->mode = PORT_DISC;
+                p->pending_close = 1;
                 at_no_carrier(port_idx);
                 return;  /* disconnection terminates command line */
             }
@@ -480,6 +473,8 @@ static void at_execute(int port_idx)
                 }
                 if (reg == 0)
                     at->s0 = (unsigned char)val;
+                else if (reg == 30)
+                    p->idle_timeout = (unsigned short)val;
                 /* All other registers accepted silently */
             } else if (i < len && cmd[i] == '?') {
                 /* Query register */
@@ -487,6 +482,7 @@ static void at_execute(int port_idx)
                 i++;
                 val = 0;
                 if (reg == 0) val = at->s0;
+                else if (reg == 30) val = (int)p->idle_timeout;
                 regbuf[0] = (char)('0' + (val / 100) % 10);
                 regbuf[1] = (char)('0' + (val / 10) % 10);
                 regbuf[2] = (char)('0' + val % 10);
@@ -558,6 +554,7 @@ int at_input(int port_idx, unsigned char b)
 {
     PortState *p = &g_state.ports[port_idx];
     AtState *at = &g_at[port_idx];
+
 
     /* +++ escape sequence detection.
      * Real Hayes: 1s silence, +++, 1s silence.
