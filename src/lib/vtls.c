@@ -1081,12 +1081,21 @@ static int tls_recv_all(int s, unsigned char *buf, int len)
 /* Send all bytes */
 static int tls_send_all(int s, const unsigned char *buf, int len)
 {
-    int sent = 0;
+    int sent = 0, loops = 0;
     while (sent < len) {
         int n;
         vsock_poll();
         n = send(s, buf + sent, len - sent, 0);
         if (n < 0) { vtls_log("send failed at %d/%d errno=%d\n", sent, len, vsock_errno); return -1; }
+        if (n == 0) {
+            loops++;
+            if (loops > 50000) {
+                vtls_log("tls_send_all: timeout %d/%d\n", sent, len);
+                return -1;
+            }
+        } else {
+            loops = 0;
+        }
         sent += n;
     }
     return sent;
