@@ -33,6 +33,62 @@ extern unsigned char g_dos_safe;
 extern unsigned char g_int14_safe;
 
 /* -----------------------------------------------------------------------
+ * ICMP callback — receives ALL incoming ICMP packets from mTCP.
+ * Checks if this is a response to our outstanding echo request.
+ * --------------------------------------------------------------------- */
+
+void vmodem_icmp_handler(const unsigned char *packet, const IcmpHeader *icmp)
+{
+    IpHeader *ip;
+    unsigned long now;
+
+    if (g_state.icmp_state != ICMP_STATE_WAITING)
+        return;
+
+    /* Ethernet header is always 14 bytes on the wire (6+6+2).
+     * Use literal to avoid any sizeof(EthHeader) packing surprises. */
+    ip = (IpHeader *)(packet + 14);
+    now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+
+    if (icmp->type == ICMP_ECHO_REPLY) {
+        /* Echo Reply: verify ident and seq match our request */
+        uint16_t *ident_ptr = (uint16_t *)icmp->payloadPtr();
+        uint16_t *seq_ptr   = ident_ptr + 1;
+        if (*ident_ptr != 0xC3C3)
+            return;
+        if (*seq_ptr != htons(g_state.icmp_seq))
+            return;
+    } else if (icmp->type == 11 || icmp->type == 3) {
+        /* Time Exceeded (11) or Destination Unreachable (3).
+         * Payload: [4 bytes unused][original IP header][8 bytes of original data]
+         * The 8 bytes are our ICMP header(4) + ident(2) + seq(2). */
+        uint8_t *payload = icmp->payloadPtr();
+        IpHeader *orig_ip = (IpHeader *)(payload + 4); /* skip 4 unused bytes */
+        uint16_t *orig_ident = (uint16_t *)(((uint8_t *)orig_ip) + orig_ip->getIpHlen() + 4);
+        if (*orig_ident != 0xC3C3)
+            return;
+    } else {
+        return;
+    }
+
+    {
+        unsigned char *r = (unsigned char *)&g_state.icmp_result;
+        r[0] = icmp->type;                          /* resp_type */
+        r[1] = icmp->code;                          /* resp_code */
+        r[2] = ip->ip_src[0];                       /* resp_ip[0] */
+        r[3] = ip->ip_src[1];                       /* resp_ip[1] */
+        r[4] = ip->ip_src[2];                       /* resp_ip[2] */
+        r[5] = ip->ip_src[3];                       /* resp_ip[3] */
+        *(unsigned short *)(r + 6) = g_state.icmp_seq; /* resp_seq */
+        *(unsigned short *)(r + 8) = (unsigned short)(now - g_state.icmp_send_tick); /* resp_rtt_ticks */
+        r[10] = ip->ttl;                            /* resp_ttl */
+        r[11] = 0;                                  /* _pad */
+    }
+
+    g_state.icmp_state = ICMP_STATE_REPLY;
+}
+
+/* -----------------------------------------------------------------------
  * do_mtcp_poll
  *
  * Drives all mTCP layers, then services each port:
@@ -95,6 +151,42 @@ void do_mtcp_poll(void)
     Tcp::drivePackets();
     g_state.poll_phase = 4;  /* DNS */
     Dns::drivePendingQuery();
+
+    /* Step 1b: ICMP send — build and transmit echo request if pending */
+    if (g_state.icmp_send_pending) {
+        #define ICMP_PAYLOAD_SIZE 32
+        uint16_t icmpLen = ICMP_PAYLOAD_SIZE + sizeof(IcmpHeader) + sizeof(uint16_t) * 2;
+
+        Icmp::icmpEchoPacket.eh.setSrc(MyEthAddr);
+        Icmp::icmpEchoPacket.eh.setType(0x0800);
+
+        Icmp::icmpEchoPacket.ip.set(IP_PROTOCOL_ICMP, g_state.icmp_dest_ip, icmpLen, 0, 0);
+
+        /* Override TTL (set() hardcodes 255) and recalculate IP checksum */
+        Icmp::icmpEchoPacket.ip.ttl = g_state.icmp_ttl;
+        Icmp::icmpEchoPacket.ip.chksum = 0;
+        Icmp::icmpEchoPacket.ip.chksum = ipchksum((uint16_t *)&Icmp::icmpEchoPacket.ip, sizeof(IpHeader));
+
+        Icmp::icmpEchoPacket.icmp.type = ICMP_ECHO_REQUEST;
+        Icmp::icmpEchoPacket.icmp.code = 0;
+        Icmp::icmpEchoPacket.icmp.checksum = 0;
+        Icmp::icmpEchoPacket.ident = 0xC3C3;
+        Icmp::icmpEchoPacket.seq = htons(g_state.icmp_seq);
+
+        for (i = 0; i < ICMP_PAYLOAD_SIZE; i++)
+            Icmp::icmpEchoPacket.data[i] = (i % 26) + 'A';
+
+        Icmp::icmpEchoPacket.icmp.checksum = ipchksum((uint16_t *)&Icmp::icmpEchoPacket.icmp, icmpLen);
+
+        /* Resolve destination Ethernet address (gateway MAC for remote hosts) */
+        if (Icmp::icmpEchoPacket.ip.setDestEth(Icmp::icmpEchoPacket.eh.dest) == 0) {
+            Packet_send_pkt(&Icmp::icmpEchoPacket,
+                            icmpLen + sizeof(EthHeader) + sizeof(IpHeader));
+            g_state.icmp_send_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            g_state.icmp_send_pending = 0;
+        }
+        /* If ARP not ready, leave pending — retry next poll cycle */
+    }
 
     g_state.poll_phase = 5;  /* port servicing */
 

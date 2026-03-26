@@ -203,6 +203,17 @@ typedef struct {
     unsigned char  dns_resolve_pad;
     char           dns_hostname[64];    /* hostname being resolved */
     IpAddr_t       dns_resolved_ip;     /* result IP address */
+
+    /* ICMP ping/traceroute state (one outstanding request at a time) */
+    unsigned char  icmp_state;          /* ICMP_STATE_* */
+    unsigned char  icmp_send_pending;   /* 1 = poll cycle should send echo request */
+    unsigned char  icmp_ttl;            /* TTL for outgoing echo */
+    unsigned char  icmp_pad0;
+    unsigned short icmp_seq;            /* sequence number */
+    unsigned short icmp_pad1;
+    IpAddr_t       icmp_dest_ip;        /* destination IP */
+    unsigned long  icmp_send_tick;      /* BIOS tick when sent */
+    IcmpMuxResult  icmp_result;         /* response details */
 } VModemState;
 
 /* StatusBlock is defined in vmodem_mux.h (shared with vmodctl, comdiag) */

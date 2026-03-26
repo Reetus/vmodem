@@ -343,12 +343,16 @@ int send(int sockfd, const void *buf, int len, int flags)
                 vsock_errno = VSOCK_ECONNRESET;
                 return total > 0 ? total : -1;
             }
-            dos_idle();
             mux_poll_internal();
             retries++;
-            if (retries > 2000) {
-                vsock_errno = VSOCK_ETIMEDOUT;
-                return total > 0 ? total : -1;
+            if (retries > 200) {
+                /* Switch to slower polling — yield CPU between attempts
+                 * so the system stays responsive */
+                dos_idle();
+                if (retries > 2000) {
+                    vsock_errno = VSOCK_ETIMEDOUT;
+                    return total > 0 ? total : -1;
+                }
             }
         }
     }
@@ -620,4 +624,62 @@ struct hostent *gethostbyname(const char *name)
 
     h_errno = HOST_NOT_FOUND;
     return (struct hostent *)0;
+}
+
+/* -----------------------------------------------------------------------
+ * ICMP ping/traceroute API
+ * ----------------------------------------------------------------------- */
+
+int vsock_icmp_send(unsigned char *dest_ip, unsigned char ttl, unsigned short seq)
+{
+    union REGS r;
+    struct SREGS sr;
+
+    /* Copy dest IP to DGROUP staging buffer */
+    mux_staging[0] = dest_ip[0];
+    mux_staging[1] = dest_ip[1];
+    mux_staging[2] = dest_ip[2];
+    mux_staging[3] = dest_ip[3];
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_SEND;
+    r.h.cl = ttl;
+    r.x.dx = seq;
+    r.x.bx = (unsigned short)(void __near *)mux_staging;
+    segread(&sr);
+    sr.es = sr.ds;
+    int86x(0x2F, &r, &r, &sr);
+
+    return 0;
+}
+
+int vsock_icmp_poll(void)
+{
+    union REGS r;
+
+    /* Drive a poll cycle so the TSR can send/receive packets */
+    mux_poll_internal();
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_POLL;
+    int86(0x2F, &r, &r);
+
+    /* Retrieve result via MUX_SOCK_RESULT */
+    return (int)mux_get_result();
+}
+
+int vsock_icmp_result(IcmpMuxResult *result)
+{
+    union REGS r;
+    struct SREGS sr;
+
+    r.h.ah = MUX_ID;
+    r.h.al = MUX_ICMP_RESULT;
+    r.x.bx = (unsigned short)(void __near *)mux_staging;
+    segread(&sr);
+    sr.es = sr.ds;
+    int86x(0x2F, &r, &r, &sr);
+
+    memcpy(result, mux_staging, sizeof(IcmpMuxResult));
+    return 0;
 }

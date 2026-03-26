@@ -457,6 +457,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Register ICMP callback for ping/traceroute MUX API */
+    extern void vmodem_icmp_handler(const unsigned char *packet, const IcmpHeader *icmp);
+    Icmp::icmpCallback = vmodem_icmp_handler;
+
     /* Register unhandled packet handler for diagnostics */
     Packet_registerDefault(unhandled_pkt_handler);
 

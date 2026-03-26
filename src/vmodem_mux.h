@@ -59,6 +59,28 @@
 #define DNS_RESOLVE_OK         2
 #define DNS_RESOLVE_ERROR      3
 
+/* ---- ICMP ping/traceroute API ---- */
+#define MUX_ICMP_SEND       0x20   /* CL=TTL, DX=seq, ES:BX->4-byte dest IP */
+#define MUX_ICMP_POLL       0x21   /* ret AX=ICMP_STATE_*                    */
+#define MUX_ICMP_RESULT     0x22   /* ES:BX->IcmpMuxResult buffer            */
+
+/* ICMP request states (returned by MUX_ICMP_POLL) */
+#define ICMP_STATE_IDLE      0
+#define ICMP_STATE_WAITING   1
+#define ICMP_STATE_REPLY     2
+#define ICMP_STATE_TIMEOUT   3
+
+/* ICMP response details (returned by MUX_ICMP_RESULT) */
+typedef struct {
+    unsigned char  resp_type;      /* ICMP type (0=echo reply, 11=time exceeded, 3=unreach) */
+    unsigned char  resp_code;
+    unsigned char  resp_ip[4];     /* source IP of the ICMP response */
+    unsigned short resp_seq;
+    unsigned short resp_rtt_ticks; /* round-trip time in BIOS ticks (~55ms each) */
+    unsigned char  resp_ttl;       /* TTL from response IP header */
+    unsigned char  _pad;
+} IcmpMuxResult;
+
 #define VMODEM_SIG       "VMODEM10"
 #define VMODEM_SIG_LEN   8
 

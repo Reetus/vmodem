@@ -270,6 +270,11 @@ void __interrupt __far __loadds int2f_handler(void)
             poll_on_priv_stack();
             _disable();
             g_state.busy = 0;
+        } else {
+            /* Busy — can't do a full poll, but enable interrupts briefly
+             * so the packet driver IRQ can fire and process pending packets */
+            _enable();
+            _disable();
         }
         break;
 
@@ -652,6 +657,55 @@ void __interrupt __far __loadds int2f_handler(void)
             name[i] = src[i];
         name[i] = '\0';
         Dns::deleteFromCache(name);
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
+    /* ---- ICMP ping/traceroute API ---- */
+
+    case MUX_ICMP_SEND:
+    {
+        /* Send ICMP echo request.  CL=TTL, DX=seq, ES:BX->4-byte dest IP.
+         * Queues the request; actual send happens in do_mtcp_poll(). */
+        unsigned char __far *src;
+        src = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        g_state.icmp_ttl = (unsigned char)(orig_cx & 0xFF);
+        g_state.icmp_seq = (unsigned short)orig_dx;
+        g_state.icmp_dest_ip[0] = src[0];
+        g_state.icmp_dest_ip[1] = src[1];
+        g_state.icmp_dest_ip[2] = src[2];
+        g_state.icmp_dest_ip[3] = src[3];
+        g_state.icmp_send_tick = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+        g_state.icmp_send_pending = 1;
+        g_state.icmp_state = ICMP_STATE_WAITING;
+        g_state.mux_sock_result = 0;
+        break;
+    }
+
+    case MUX_ICMP_POLL:
+    {
+        /* Poll ICMP request state.  Returns ICMP_STATE_* via mux_sock_result.
+         * Also checks for timeout (~5 seconds = 91 BIOS ticks). */
+        if (g_state.icmp_state == ICMP_STATE_WAITING && !g_state.icmp_send_pending) {
+            unsigned long now = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C);
+            if (now - g_state.icmp_send_tick > 91UL)
+                g_state.icmp_state = ICMP_STATE_TIMEOUT;
+        }
+        g_state.mux_sock_result = g_state.icmp_state;
+        break;
+    }
+
+    case MUX_ICMP_RESULT:
+    {
+        /* Copy IcmpMuxResult to caller's buffer at ES:BX, then reset to IDLE. */
+        unsigned char __far *dst;
+        unsigned char *s;
+        int n;
+        dst = (unsigned char __far *)MK_FP(orig_es, orig_bx);
+        s = (unsigned char *)&g_state.icmp_result;
+        for (n = 0; n < (int)sizeof(IcmpMuxResult); n++)
+            dst[n] = s[n];
+        g_state.icmp_state = ICMP_STATE_IDLE;
         g_state.mux_sock_result = 0;
         break;
     }
