@@ -50,6 +50,9 @@
 /* BSD socket API wrapping VMODEM's MUX socket interface */
 #include "lib/vsocket.h"
 
+/* TLS 1.2 client */
+#include "vtls.h"
+
 /* Status word bits */
 #define STATUS_RDA       0x0100  /* AH bit 0: receive data available */
 #define STATUS_THRE      0x2000  /* AH bit 5: TX holding register empty */
@@ -1818,6 +1821,110 @@ static void test_zmodem_send(void)
     fossil_deinit(port);
 }
 
+/* ---- TLS IRC test ---- */
+static void test_tls_irc(const char *hostname, unsigned short port)
+{
+    struct hostent *he;
+    struct sockaddr_in sa;
+    int sock, n;
+    char buf[512];
+
+    printf("TLS IRC test: %s:%u\n", hostname, port);
+
+    if (vsock_init() < 0) {
+        log_result("TLS_IRC", 0, "vsock_init failed");
+        return;
+    }
+    log_result("TLS_IRC", 1, "vsock_init");
+
+    printf("Resolving %s...\n", hostname);
+    he = gethostbyname(hostname);
+    if (!he) {
+        log_result("TLS_IRC", 0, "DNS resolve failed");
+        return;
+    }
+    log_result("TLS_IRC", 1, "DNS resolve");
+
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        log_result("TLS_IRC", 0, "socket failed");
+        return;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    memcpy(&sa.sin_addr, he->h_addr, 4);
+
+    printf("Connecting...\n");
+    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        log_result("TLS_IRC", 0, "connect failed");
+        closesocket(sock);
+        return;
+    }
+    log_result("TLS_IRC", 1, "TCP connect");
+
+    printf("TLS handshake...\n");
+    if (vtls_handshake(sock) < 0) {
+        log_result("TLS_IRC", 0, "TLS handshake failed");
+        closesocket(sock);
+        return;
+    }
+    log_result("TLS_IRC", 1, "TLS handshake");
+
+    /* Show peer certificate CN */
+    {
+        char cn[128];
+        if (vtls_peer_cn(sock, cn, sizeof(cn)) > 0) {
+            printf("Peer CN: %s\n", cn);
+            log_result("TLS_IRC", 1, cn);
+        }
+    }
+
+    /* Send IRC NICK and USER */
+    {
+        const char *nick_cmd = "NICK vtlstest\r\n";
+        const char *user_cmd = "USER vtlstest 0 * :vtls test\r\n";
+        vtls_send(sock, nick_cmd, (int)strlen(nick_cmd));
+        vtls_send(sock, user_cmd, (int)strlen(user_cmd));
+    }
+
+    /* Read some IRC server responses */
+    printf("Reading IRC responses...\n");
+    {
+        int total = 0;
+        unsigned long timeout = get_tick() + 182; /* ~10 seconds */
+        while (total < (int)sizeof(buf) - 1 && get_tick() < timeout) {
+            vsock_poll();
+            n = vtls_recv(sock, buf + total, (int)sizeof(buf) - 1 - total);
+            if (n > 0) {
+                total += n;
+                buf[total] = '\0';
+                if (strstr(buf, "\r\n")) break;
+            } else if (n < 0) {
+                break;
+            }
+        }
+        buf[total] = '\0';
+        if (total > 0) {
+            printf("Got %d bytes: %.60s...\n", total, buf);
+            log_result("TLS_IRC", 1, "recv data");
+        } else {
+            log_result("TLS_IRC", 0, "no data received");
+        }
+    }
+
+    /* Send QUIT */
+    {
+        const char *quit = "QUIT :bye\r\n";
+        vtls_send(sock, quit, (int)strlen(quit));
+    }
+
+    vtls_close(sock);
+    closesocket(sock);
+    log_result("TLS_IRC", 1, "close");
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char *argv[])
@@ -1912,6 +2019,11 @@ int main(int argc, char *argv[])
             test_block_echo();
         else if (strcmp(upper, "ZMODEM_SEND") == 0)
             test_zmodem_send();
+        else if (strcmp(upper, "TLS_IRC") == 0) {
+            const char *host = argc > 2 ? argv[2] : "irc.libera.chat";
+            unsigned short port = argc > 3 ? (unsigned short)atoi(argv[3]) : 6697;
+            test_tls_irc(host, port);
+        }
         else {
             printf("Unknown test: %s\n", upper);
             fprintf(logfile, "FAIL: UNKNOWN_TEST %s\n", upper);

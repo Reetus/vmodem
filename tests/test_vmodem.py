@@ -48,6 +48,7 @@ from test_relay import test_relay
 from test_single_busy import test_single_busy
 from test_naws import test_naws
 from test_ttype import test_ttype
+from test_tls_irc import test_tls_irc
 
 
 ALL_TESTS = {
@@ -71,6 +72,7 @@ ALL_TESTS = {
     "test_single_busy": test_single_busy,
     "test_naws": test_naws,
     "test_ttype": test_ttype,
+    "test_tls_irc": test_tls_irc,
 }
 
 
