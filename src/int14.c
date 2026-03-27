@@ -427,10 +427,25 @@ void __interrupt __far __loadds int14_real_handler(void)
              * bytes out of order if pending data exists. */
             if (p->mode == PORT_CONN && p->sock != NULL && !at_is_ringing(port_idx)) {
                 if (txring_put(&g_tx[port_idx], byte_to_send) < 0) {
-                    fossil_flush_tx(port_idx);
-                    txring_put(&g_tx[port_idx], byte_to_send);
-                    /* If still full, byte is lost — THRE status will
-                     * tell caller to back off on next AH=03h check */
+                    /* Ring full — flush and retry with a deadline.
+                     * FOSSIL spec says AH=01h waits until room exists.
+                     * Spin for up to ~1 second (18 ticks) to honour that. */
+                    unsigned long deadline = *(volatile unsigned long __far *)MK_FP(0x0040, 0x006C) + 18;
+                    do {
+                        fossil_flush_tx(port_idx);
+                        if (txring_put(&g_tx[port_idx], byte_to_send) == 0)
+                            break;
+                        /* Drive mTCP so TCP ACKs can free send buffers */
+                        if (!g_state.busy) {
+                            g_state.busy = 1;
+                            g_int14_safe = 1;
+                            _enable();
+                            poll_on_priv_stack();
+                            _disable();
+                            g_int14_safe = 0;
+                            g_state.busy = 0;
+                        }
+                    } while (*(volatile unsigned long __far *)MK_FP(0x0040, 0x006C) < deadline);
                 }
             }
         }

@@ -683,3 +683,9 @@ int vsock_icmp_result(IcmpMuxResult *result)
     memcpy(result, mux_staging, sizeof(IcmpMuxResult));
     return 0;
 }
+
+/* No-op on DOS — vsocket recv() is already non-blocking */
+void vsock_set_nonblock(int sockfd)
+{
+    (void)sockfd;
+}

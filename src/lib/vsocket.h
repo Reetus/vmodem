@@ -112,6 +112,7 @@ in_addr_t       inet_addr(const char *cp);
 int             vsock_init(void);   /* check TSR loaded; returns 0=ok, -1=absent */
 void            vsock_poll(void);   /* drive one mTCP poll cycle */
 int             vsock_data_ready(int sockfd); /* 1 if recv data waiting, 0 if not */
+void            vsock_set_nonblock(int sockfd); /* no-op on DOS (recv already non-blocking) */
 
 /* ---- ICMP ping/traceroute API ---- */
 int             vsock_icmp_send(unsigned char *dest_ip, unsigned char ttl, unsigned short seq);
